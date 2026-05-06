@@ -1,0 +1,7 @@
+# CMake build outputs
+build/
+
+# Local editor/system files
+.DS_Store
+.cache/
+.vscode/

@@ -1,0 +1,6 @@
+set(LLVM_TARGET_DEFINITIONS EGraphOps.td)
+mlir_tablegen(EGraphOps.h.inc -gen-op-decls)
+mlir_tablegen(EGraphOps.cpp.inc -gen-op-defs)
+mlir_tablegen(EGraphOpsDialect.h.inc -gen-dialect-decls -dialect=egraph)
+mlir_tablegen(EGraphOpsDialect.cpp.inc -gen-dialect-defs -dialect=egraph)
+add_mlir_dialect_tablegen_target(EGraphOpsIncGen)

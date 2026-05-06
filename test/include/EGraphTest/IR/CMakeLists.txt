@@ -1,0 +1,6 @@
+set(LLVM_TARGET_DEFINITIONS EGraphTestOps.td)
+mlir_tablegen(EGraphTestOps.h.inc -gen-op-decls)
+mlir_tablegen(EGraphTestOps.cpp.inc -gen-op-defs)
+mlir_tablegen(EGraphTestOpsDialect.h.inc -gen-dialect-decls -dialect=egraph_test)
+mlir_tablegen(EGraphTestOpsDialect.cpp.inc -gen-dialect-defs -dialect=egraph_test)
+add_mlir_dialect_tablegen_target(EGraphTestOpsIncGen)
