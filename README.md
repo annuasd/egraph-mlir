@@ -37,3 +37,7 @@ Run the standalone demo:
 ```sh
 build/bin/mlir-egraph-demo
 ```
+
+## License
+
+MLIR-EGraph is licensed under the MIT License. See [LICENSE](LICENSE).
