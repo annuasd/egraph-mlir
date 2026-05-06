@@ -28,15 +28,14 @@ bool hasConstantIntegerDef(mlir::egraph::EValue value, int64_t expected) {
 }
 
 mlir::FailureOr<mlir::egraph::EGraphExtractCost>
-getDemoExtractCost(mlir::Operation *candidate) {
-  llvm::StringRef operationName = candidate->getName().getStringRef();
-  if (operationName == mlir::arith::ConstantOp::getOperationName())
+getDemoExtractCost(mlir::Operation *op) {
+  if (llvm::isa<mlir::arith::ConstantOp>(op))
     return mlir::egraph::EGraphExtractCost(1);
-  if (operationName == mlir::arith::ShLIOp::getOperationName())
+  if (llvm::isa<mlir::arith::ShLIOp>(op))
     return mlir::egraph::EGraphExtractCost(1);
-  if (operationName == mlir::arith::MulIOp::getOperationName())
+  if (llvm::isa<mlir::arith::MulIOp>(op))
     return mlir::egraph::EGraphExtractCost(4);
-  if (operationName == mlir::arith::DivSIOp::getOperationName())
+  if (llvm::isa<mlir::arith::DivSIOp>(op))
     return mlir::egraph::EGraphExtractCost(8);
   return mlir::egraph::EGraphExtractCost(16);
 }
