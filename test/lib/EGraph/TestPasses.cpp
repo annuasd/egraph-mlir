@@ -31,7 +31,29 @@ void registerEGraphTestPasses();
 
 #if defined(MLIR_EGRAPH_ENABLE_TEST_DIALECT) &&                                \
     defined(MLIR_EGRAPH_TEST_LIBRARY)
+namespace mlir::egraph {
+mlir::FailureOr<EGraphMatchStats>
+applyEGraphPatterns(mlir::egraph::EGraph &graph,
+                    const EGraphPatternSet &patterns,
+                    mlir::Operation *rebuildRoot,
+                    const EGraphMatchConfig &config);
+mlir::FailureOr<EGraphMatchStats>
+applyEGraphPatterns(mlir::egraph::EGraph &graph,
+                    const EGraphPatternSet &patterns,
+                    mlir::Operation *rebuildRoot);
+mlir::LogicalResult extractEGraphForTesting(
+    mlir::egraph::EGraph &graph, EGraphOp egraph, EGraphExtractMode mode,
+    EGraphExtractCostModel costModel, EGraphExtractInfo *info,
+    llvm::ArrayRef<mlir::egraph::EValue> explicitRoots = {});
+mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>>
+materializeEGraphExtractInfoForTesting(
+    mlir::egraph::EGraph &graph, EGraphOp egraph,
+    const EGraphExtractInfo &selection, mlir::OpBuilder &builder,
+    llvm::ArrayRef<mlir::Value> inputValues);
+} // namespace mlir::egraph
+
 namespace {
+
 mlir::LogicalResult indexTestGraph(mlir::Operation *root,
                                    mlir::egraph::EGraph &graph) {
   auto module = mlir::dyn_cast<mlir::ModuleOp>(root);
@@ -90,10 +112,10 @@ mlir::LogicalResult seedDirtyWorklistGraph(mlir::ModuleOp module,
 
 void emitDriverStatsRemark(
     mlir::Operation *anchor,
-    const mlir::egraph::EGraphRewriteDriverResult &result) {
+    const mlir::egraph::EGraphMatchStats &result) {
   std::string buffer;
   llvm::raw_string_ostream os(buffer);
-  mlir::egraph::printEGraphRewriteDriverResult(os, result);
+  mlir::egraph::printEGraphMatchStats(os, result);
   os.flush();
   anchor->emitRemark() << "worklist driver stats: " << buffer;
 }
@@ -124,21 +146,20 @@ std::string formatExtractRoots(llvm::ArrayRef<mlir::egraph::EValue> roots) {
 }
 
 mlir::LogicalResult
-verifyExtractRequestRoots(mlir::Operation *anchor,
-                          const mlir::egraph::EGraphExtractRequest &request,
-                          llvm::ArrayRef<mlir::StringAttr> expectedRoots) {
-  if (request.roots.size() != expectedRoots.size())
-    return anchor->emitOpError("extract request returned ")
-           << request.roots.size() << " root(s), expected "
-           << expectedRoots.size();
+verifyExtractRoots(mlir::Operation *anchor,
+                   llvm::ArrayRef<mlir::egraph::EValue> roots,
+                   llvm::ArrayRef<mlir::StringAttr> expectedRoots) {
+  if (roots.size() != expectedRoots.size())
+    return anchor->emitOpError("extract returned ")
+           << roots.size() << " root(s), expected " << expectedRoots.size();
 
-  for (auto indexedRoot : llvm::enumerate(request.roots)) {
+  for (auto indexedRoot : llvm::enumerate(roots)) {
     mlir::egraph::EValue root = indexedRoot.value();
     if (root.getResultIndex() != 0)
-      return anchor->emitOpError("extract request root #")
+      return anchor->emitOpError("extract root #")
              << indexedRoot.index() << " did not use result slot 0";
     if (root.getSymbolNameAttr() != expectedRoots[indexedRoot.index()])
-      return anchor->emitOpError("extract request root #")
+      return anchor->emitOpError("extract root #")
              << indexedRoot.index() << " was @"
              << root.getSymbolNameAttr().getValue() << ", expected @"
              << expectedRoots[indexedRoot.index()].getValue();
@@ -147,8 +168,8 @@ verifyExtractRequestRoots(mlir::Operation *anchor,
   return mlir::success();
 }
 
-mlir::LogicalResult verifyExtractRequestSemantics(mlir::ModuleOp module,
-                                                  mlir::egraph::EGraph &graph) {
+mlir::LogicalResult verifyExtractInfoSemantics(mlir::ModuleOp module,
+                                               mlir::egraph::EGraph &graph) {
   mlir::FailureOr<mlir::egraph::EGraphOp> egraph =
       getSingleActiveEGraph(module);
   if (mlir::failed(egraph))
@@ -160,58 +181,68 @@ mlir::LogicalResult verifyExtractRequestSemantics(mlir::ModuleOp module,
   if (!lhs || !rhs || !user)
     return egraph->emitOpError("expected @lhs, @rhs, and @user symbols");
 
-  mlir::FailureOr<mlir::egraph::EGraphExtractRequest> defaultRequest =
-      mlir::egraph::buildEGraphExtractRequest(graph, *egraph);
-  if (mlir::failed(defaultRequest))
-    return egraph->emitOpError("failed to build default extract request");
-  if (defaultRequest->mode != mlir::egraph::EGraphExtractMode::Greedy)
-    return egraph->emitOpError("default extract request used a wrong mode");
+  auto costModel = [](mlir::Operation *)
+      -> mlir::FailureOr<mlir::egraph::EGraphExtractCost> {
+    return mlir::egraph::EGraphExtractCost(0);
+  };
+
+  mlir::egraph::EGraphExtractInfo defaultInfo;
+  if (mlir::failed(mlir::egraph::extractEGraphForTesting(
+          graph, *egraph, mlir::egraph::EGraphExtractMode::Greedy, costModel,
+          &defaultInfo)))
+    return egraph->emitOpError("failed to extract default info");
+  if (defaultInfo.mode != mlir::egraph::EGraphExtractMode::Greedy)
+    return egraph->emitOpError("default extract info used a wrong mode");
   llvm::SmallVector<mlir::StringAttr, 4> defaultRoots = {rhs.getSymNameAttr(),
                                                          user.getSymNameAttr()};
-  if (mlir::failed(verifyExtractRequestRoots(egraph->getOperation(),
-                                             *defaultRequest, defaultRoots)))
+  if (mlir::failed(
+          verifyExtractRoots(egraph->getOperation(), defaultInfo.roots,
+                             defaultRoots)))
     return mlir::failure();
 
-  egraph->emitRemark() << "extract request default roots -> "
-                       << formatExtractRoots(defaultRequest->roots) << " mode="
+  egraph->emitRemark() << "extract info default roots -> "
+                       << formatExtractRoots(defaultInfo.roots) << " mode="
                        << mlir::egraph::stringifyEGraphExtractMode(
-                              defaultRequest->mode);
+                              defaultInfo.mode);
 
   llvm::SmallVector<mlir::egraph::EValue, 4> explicitRoots = {
       graph.getValue(lhs.getSymNameAttr()),
       graph.getValue(user.getSymNameAttr())};
-  mlir::FailureOr<mlir::egraph::EGraphExtractRequest> explicitRequest =
-      mlir::egraph::buildEGraphExtractRequest(
-          graph, *egraph, explicitRoots,
-          mlir::egraph::EGraphExtractMode::LinearProgramming);
-  if (mlir::failed(explicitRequest))
-    return egraph->emitOpError("failed to build explicit extract request");
-  if (explicitRequest->mode !=
+  mlir::egraph::EGraphExtractInfo explicitInfo;
+  if (mlir::failed(mlir::egraph::extractEGraphForTesting(
+          graph, *egraph, mlir::egraph::EGraphExtractMode::LinearProgramming,
+          costModel, &explicitInfo, explicitRoots)))
+    return egraph->emitOpError("failed to extract explicit info");
+  if (explicitInfo.mode !=
       mlir::egraph::EGraphExtractMode::LinearProgramming)
-    return egraph->emitOpError("explicit extract request lost its mode");
+    return egraph->emitOpError("explicit extract info lost its mode");
   llvm::SmallVector<mlir::StringAttr, 4> explicitExpectedRoots = {
       lhs.getSymNameAttr(), user.getSymNameAttr()};
-  if (mlir::failed(verifyExtractRequestRoots(
-          egraph->getOperation(), *explicitRequest, explicitExpectedRoots)))
+  if (mlir::failed(verifyExtractRoots(egraph->getOperation(),
+                                      explicitInfo.roots,
+                                      explicitExpectedRoots)))
     return mlir::failure();
 
-  egraph->emitRemark() << "extract request explicit roots -> "
-                       << formatExtractRoots(explicitRequest->roots) << " mode="
+  egraph->emitRemark() << "extract info explicit roots -> "
+                       << formatExtractRoots(explicitInfo.roots) << " mode="
                        << mlir::egraph::stringifyEGraphExtractMode(
-                              explicitRequest->mode);
+                              explicitInfo.mode);
 
   mlir::FailureOr<mlir::egraph::EGraphUnionResult> unioned =
       graph.unionValues(graph.getValue(lhs.getSymNameAttr()),
                         graph.getValue(rhs.getSymNameAttr()));
   if (mlir::failed(unioned) || !unioned->changed)
-    return egraph->emitOpError("failed to dirty extract request graph");
+    return egraph->emitOpError("failed to dirty extract info graph");
   if (graph.isClean())
     return egraph->emitOpError("dirty union unexpectedly left graph clean");
-  if (mlir::succeeded(mlir::egraph::buildEGraphExtractRequest(graph, *egraph)))
+  mlir::egraph::EGraphExtractInfo dirtyInfo;
+  if (mlir::succeeded(mlir::egraph::extractEGraphForTesting(
+          graph, *egraph, mlir::egraph::EGraphExtractMode::Greedy, costModel,
+          &dirtyInfo)))
     return egraph->emitOpError(
-        "extract request unexpectedly accepted a dirty graph");
+        "extract unexpectedly accepted a dirty graph");
 
-  egraph->emitRemark() << "extract request rejected dirty graph";
+  egraph->emitRemark() << "extract info rejected dirty graph";
   return mlir::success();
 }
 
@@ -223,56 +254,50 @@ verifyExtractCostModelSelection(mlir::ModuleOp module,
   if (mlir::failed(egraph))
     return module.emitError("expected one active egraph.egraph");
 
-  mlir::FailureOr<mlir::egraph::EGraphExtractRequest> request =
-      mlir::egraph::buildEGraphExtractRequest(
-          graph, *egraph, {},
-          mlir::egraph::EGraphExtractMode::LinearProgramming);
-  if (mlir::failed(request))
-    return egraph->emitOpError("failed to build extract request");
-
-  auto costModel = [](mlir::egraph::EOpRefBase candidate)
+  auto costModel = [](mlir::Operation *candidate)
       -> mlir::FailureOr<mlir::egraph::EGraphExtractCost> {
-    if (candidate.getOperationName() == "arith.muli")
+    if (candidate->getName().getStringRef() == "arith.muli")
       return mlir::egraph::EGraphExtractCost(1);
-    if (candidate.getOperationName() == "arith.addi")
+    if (candidate->getName().getStringRef() == "arith.addi")
       return mlir::egraph::EGraphExtractCost(7);
     return mlir::failure();
   };
 
-  mlir::FailureOr<mlir::egraph::EGraphExtractResult> selection =
-      mlir::egraph::selectEGraphExtractCandidates(graph, *request, costModel);
-  if (mlir::failed(selection))
+  mlir::egraph::EGraphExtractInfo selection;
+  if (mlir::failed(mlir::egraph::extractEGraphForTesting(
+          graph, *egraph, mlir::egraph::EGraphExtractMode::LinearProgramming,
+          costModel, &selection)))
     return egraph->emitOpError("failed to select extract candidates");
 
-  if (selection->roots.size() != 1 ||
-      selection->selectedCandidateRoots.size() !=
-          selection->selectedCandidateCosts.size() ||
-      selection->selectedCandidateRoots.size() !=
-          selection->selectedSubtreeCosts.size() ||
-      selection->selectedEClasses.size() != selection->roots.size() ||
-      selection->rootCosts.size() != selection->roots.size())
+  if (selection.roots.size() != 1 ||
+      selection.selectedCandidateRoots.size() !=
+          selection.selectedCandidateCosts.size() ||
+      selection.selectedCandidateRoots.size() !=
+          selection.selectedSubtreeCosts.size() ||
+      selection.selectedEClasses.size() != selection.roots.size() ||
+      selection.rootCosts.size() != selection.roots.size())
     return egraph->emitOpError("unexpected extract selection shape");
 
-  if (selection->selectedCandidateRoots.front().getOperationName() !=
+  if (selection.selectedCandidateRoots.front().getOperationName() !=
           "arith.muli" ||
-      selection->selectedCandidateCosts.front() != 1 ||
-      selection->selectedSubtreeCosts.front() != 1 ||
-      selection->rootCosts.front() != 1)
+      selection.selectedCandidateCosts.front() != 1 ||
+      selection.selectedSubtreeCosts.front() != 1 ||
+      selection.rootCosts.front() != 1)
     return egraph->emitOpError("extract cost model selected the wrong root");
 
   egraph->emitRemark()
-      << "extract cost selection -> " << formatExtractRoots(selection->roots)
+      << "extract cost selection -> " << formatExtractRoots(selection.roots)
       << " candidate="
-      << selection->selectedCandidateRoots.front().getOperationName()
-      << " cost=" << selection->selectedCandidateCosts.front()
-      << " subtree=" << selection->selectedSubtreeCosts.front()
-      << " root_cost=" << selection->rootCosts.front()
-      << " mode=" << mlir::egraph::stringifyEGraphExtractMode(selection->mode);
+      << selection.selectedCandidateRoots.front().getOperationName()
+      << " cost=" << selection.selectedCandidateCosts.front()
+      << " subtree=" << selection.selectedSubtreeCosts.front()
+      << " root_cost=" << selection.rootCosts.front()
+      << " mode=" << mlir::egraph::stringifyEGraphExtractMode(selection.mode);
   return mlir::success();
 }
 
 mlir::FailureOr<unsigned>
-findExtractSelection(const mlir::egraph::EGraphExtractResult &selection,
+findExtractSelection(const mlir::egraph::EGraphExtractInfo &selection,
                      llvm::StringRef symbolName) {
   for (auto indexedEClass : llvm::enumerate(selection.selectedEClasses)) {
     mlir::egraph::EValue eclass = indexedEClass.value();
@@ -284,7 +309,7 @@ findExtractSelection(const mlir::egraph::EGraphExtractResult &selection,
 
 mlir::LogicalResult
 verifyExtractSelectionOrder(mlir::Operation *anchor,
-                            const mlir::egraph::EGraphExtractResult &selection,
+                            const mlir::egraph::EGraphExtractInfo &selection,
                             llvm::ArrayRef<llvm::StringRef> expectedSymbols,
                             llvm::StringRef selectionKind) {
   if (selection.selectedEClasses.size() != expectedSymbols.size())
@@ -307,7 +332,7 @@ verifyExtractSelectionOrder(mlir::Operation *anchor,
 }
 
 mlir::LogicalResult verifyExtractAliasSelection(
-    mlir::Operation *anchor, const mlir::egraph::EGraphExtractResult &selection,
+    mlir::Operation *anchor, const mlir::egraph::EGraphExtractInfo &selection,
     llvm::ArrayRef<llvm::StringRef> expectedAliasSymbols,
     llvm::ArrayRef<llvm::StringRef> expectedAliasTargets,
     llvm::StringRef selectionKind) {
@@ -338,7 +363,7 @@ mlir::LogicalResult verifyExtractAliasSelection(
 }
 
 mlir::LogicalResult verifyExtractSelectedEClass(
-    mlir::Operation *anchor, const mlir::egraph::EGraphExtractResult &selection,
+    mlir::Operation *anchor, const mlir::egraph::EGraphExtractInfo &selection,
     llvm::StringRef symbolName, llvm::StringRef operationName,
     mlir::egraph::EGraphExtractCost expectedLocalCost,
     mlir::egraph::EGraphExtractCost expectedSubtreeCost,
@@ -382,14 +407,14 @@ mlir::LogicalResult verifyExtractSelectedEClass(
 
 mlir::LogicalResult
 verifyGreedySelectionOrder(mlir::Operation *anchor,
-                           const mlir::egraph::EGraphExtractResult &selection,
+                           const mlir::egraph::EGraphExtractInfo &selection,
                            llvm::ArrayRef<llvm::StringRef> expectedSymbols) {
   return verifyExtractSelectionOrder(anchor, selection, expectedSymbols,
                                      "greedy");
 }
 
 mlir::LogicalResult verifyGreedyAliasSelection(
-    mlir::Operation *anchor, const mlir::egraph::EGraphExtractResult &selection,
+    mlir::Operation *anchor, const mlir::egraph::EGraphExtractInfo &selection,
     llvm::ArrayRef<llvm::StringRef> expectedAliasSymbols,
     llvm::ArrayRef<llvm::StringRef> expectedAliasTargets) {
   return verifyExtractAliasSelection(anchor, selection, expectedAliasSymbols,
@@ -397,7 +422,7 @@ mlir::LogicalResult verifyGreedyAliasSelection(
 }
 
 mlir::LogicalResult verifyGreedySelectedEClass(
-    mlir::Operation *anchor, const mlir::egraph::EGraphExtractResult &selection,
+    mlir::Operation *anchor, const mlir::egraph::EGraphExtractInfo &selection,
     llvm::StringRef symbolName, llvm::StringRef operationName,
     mlir::egraph::EGraphExtractCost expectedLocalCost,
     mlir::egraph::EGraphExtractCost expectedSubtreeCost) {
@@ -407,16 +432,16 @@ mlir::LogicalResult verifyGreedySelectedEClass(
 }
 
 mlir::LogicalResult verifyLinearProgrammingSelectionOrder(
-    mlir::Operation *anchor, const mlir::egraph::EGraphExtractResult &selection,
+    mlir::Operation *anchor, const mlir::egraph::EGraphExtractInfo &selection,
     llvm::ArrayRef<llvm::StringRef> expectedSymbols);
 
 mlir::LogicalResult verifyLinearProgrammingAliasSelection(
-    mlir::Operation *anchor, const mlir::egraph::EGraphExtractResult &selection,
+    mlir::Operation *anchor, const mlir::egraph::EGraphExtractInfo &selection,
     llvm::ArrayRef<llvm::StringRef> expectedAliasSymbols,
     llvm::ArrayRef<llvm::StringRef> expectedAliasTargets);
 
 mlir::LogicalResult verifyLinearProgrammingSelectedEClass(
-    mlir::Operation *anchor, const mlir::egraph::EGraphExtractResult &selection,
+    mlir::Operation *anchor, const mlir::egraph::EGraphExtractInfo &selection,
     llvm::StringRef symbolName, llvm::StringRef operationName,
     mlir::egraph::EGraphExtractCost expectedLocalCost,
     mlir::egraph::EGraphExtractCost expectedSubtreeCost);
@@ -450,89 +475,80 @@ mlir::LogicalResult verifyGreedyExtract(mlir::ModuleOp module,
     if (!input || !alias)
       return egraph->emitOpError("rebuilt input alias graph lost @x or @alias");
 
-    mlir::FailureOr<mlir::egraph::EGraphExtractRequest> request =
-        mlir::egraph::buildEGraphExtractRequest(graph, *egraph);
-    if (mlir::failed(request))
-      return egraph->emitOpError(
-          "failed to build rebuilt input alias extract request");
-
-    auto costModel = [](mlir::egraph::EOpRefBase candidate)
+    auto costModel = [](mlir::Operation *candidate)
         -> mlir::FailureOr<mlir::egraph::EGraphExtractCost> {
-      if (candidate.getOperationName() == "arith.addi")
+      if (candidate->getName().getStringRef() == "arith.addi")
         return mlir::egraph::EGraphExtractCost(1);
       return mlir::failure();
     };
 
-    mlir::FailureOr<mlir::egraph::EGraphExtractResult> selection =
-        mlir::egraph::extractEGraphGreedily(graph, *egraph, *request,
-                                            costModel);
-    if (mlir::failed(selection))
+    mlir::egraph::EGraphExtractInfo selection;
+    if (mlir::failed(mlir::egraph::extractEGraphForTesting(
+            graph, *egraph, mlir::egraph::EGraphExtractMode::Greedy, costModel,
+            &selection)))
       return egraph->emitOpError(
           "failed to greedy extract rebuilt input alias graph");
 
-    if (selection->roots.size() != 1 || selection->rootCosts.size() != 1 ||
-        selection->selectedAliasEClasses.size() != 1 ||
-        selection->selectedAliasTargets.size() != 1 ||
-        !selection->selectedCandidateRoots.empty() ||
-        !selection->selectedCandidateCosts.empty() ||
-        !selection->selectedSubtreeCosts.empty())
+    if (selection.roots.size() != 1 || selection.rootCosts.size() != 1 ||
+        selection.selectedAliasEClasses.size() != 1 ||
+        selection.selectedAliasTargets.size() != 1 ||
+        !selection.selectedCandidateRoots.empty() ||
+        !selection.selectedCandidateCosts.empty() ||
+        !selection.selectedSubtreeCosts.empty())
       return egraph->emitOpError("unexpected rebuilt alias extract shape");
 
-    if (selection->selectedAliasEClasses.front().getSymbolName() != "alias" ||
-        selection->selectedAliasTargets.front().getSymbolName() != "x" ||
-        selection->rootCosts.front() != 0)
+    if (selection.selectedAliasEClasses.front().getSymbolName() != "alias" ||
+        selection.selectedAliasTargets.front().getSymbolName() != "x" ||
+        selection.rootCosts.front() != 0)
       return egraph->emitOpError(
           "rebuilt input alias was not preserved by greedy extract");
 
     egraph->emitRemark()
         << "rebuilt input alias greedy extract preserved @"
-        << selection->selectedAliasEClasses.front().getSymbolName() << " -> @"
-        << selection->selectedAliasTargets.front().getSymbolName()
-        << " cost=" << selection->rootCosts.front();
+        << selection.selectedAliasEClasses.front().getSymbolName() << " -> @"
+        << selection.selectedAliasTargets.front().getSymbolName()
+        << " cost=" << selection.rootCosts.front();
     return mlir::success();
   }
-
-  mlir::FailureOr<mlir::egraph::EGraphExtractRequest> request =
-      mlir::egraph::buildEGraphExtractRequest(graph, *egraph);
-  if (mlir::failed(request))
-    return egraph->emitOpError("failed to build greedy extract request");
 
   mlir::Builder builder(module.getContext());
   llvm::SmallVector<mlir::StringAttr, 3> expectedRoots = {
       builder.getStringAttr("root"), builder.getStringAttr("loop"),
       builder.getStringAttr("alias_root")};
-  if (mlir::failed(verifyExtractRequestRoots(egraph->getOperation(), *request,
-                                             expectedRoots)))
-    return mlir::failure();
 
-  auto costModel = [](mlir::egraph::EOpRefBase candidate)
+  auto costModel = [](mlir::Operation *candidate)
       -> mlir::FailureOr<mlir::egraph::EGraphExtractCost> {
-    if (candidate.getOperationName() == "arith.addi")
+    if (candidate->getName().getStringRef() == "arith.addi")
       return mlir::egraph::EGraphExtractCost(1);
-    if (candidate.getOperationName() == "arith.muli")
+    if (candidate->getName().getStringRef() == "arith.muli")
       return mlir::egraph::EGraphExtractCost(4);
-    if (candidate.getOperationName() == "arith.subi")
+    if (candidate->getName().getStringRef() == "arith.subi")
       return mlir::egraph::EGraphExtractCost(10);
     return mlir::failure();
   };
 
-  mlir::FailureOr<mlir::egraph::EGraphExtractResult> selection =
-      mlir::egraph::extractEGraphGreedily(graph, *egraph, *request, costModel);
-  if (mlir::failed(selection))
+  mlir::egraph::EGraphExtractInfo selection;
+  if (mlir::failed(mlir::egraph::extractEGraphForTesting(
+          graph, *egraph, mlir::egraph::EGraphExtractMode::Greedy, costModel,
+          &selection)))
     return egraph->emitOpError("failed to run greedy extract");
 
-  if (selection->mode != mlir::egraph::EGraphExtractMode::Greedy ||
-      selection->selectedEClasses.size() !=
-          selection->selectedCandidateRoots.size() ||
-      selection->selectedEClasses.size() !=
-          selection->selectedCandidateCosts.size() ||
-      selection->selectedEClasses.size() !=
-          selection->selectedSubtreeCosts.size() ||
-      selection->selectedAliasEClasses.size() !=
-          selection->selectedAliasTargets.size())
+  if (selection.mode != mlir::egraph::EGraphExtractMode::Greedy ||
+      selection.selectedEClasses.size() !=
+          selection.selectedCandidateRoots.size() ||
+      selection.selectedEClasses.size() !=
+          selection.selectedCandidateCosts.size() ||
+      selection.selectedEClasses.size() !=
+          selection.selectedSubtreeCosts.size() ||
+          selection.selectedAliasEClasses.size() !=
+          selection.selectedAliasTargets.size())
     return egraph->emitOpError("unexpected greedy extract result shape");
 
-  if (selection->selectedEClasses.size() != 3)
+  if (mlir::failed(verifyExtractRoots(egraph->getOperation(), selection.roots,
+                                      expectedRoots)))
+    return mlir::failure();
+
+  if (selection.selectedEClasses.size() != 3)
     return egraph->emitOpError("expected three selected greedy candidates");
 
   llvm::SmallVector<llvm::StringRef, 3> expectedSelectedSymbols = {
@@ -541,28 +557,28 @@ mlir::LogicalResult verifyGreedyExtract(mlir::ModuleOp module,
                                                                 "alias_root"};
   llvm::SmallVector<llvm::StringRef, 2> expectedAliasTargets = {"cheap",
                                                                 "alias_leaf"};
-  if (mlir::failed(verifyGreedySelectionOrder(*egraph, *selection,
+  if (mlir::failed(verifyGreedySelectionOrder(*egraph, selection,
                                               expectedSelectedSymbols)) ||
       mlir::failed(verifyGreedyAliasSelection(
-          *egraph, *selection, expectedAliasSymbols, expectedAliasTargets)) ||
+          *egraph, selection, expectedAliasSymbols, expectedAliasTargets)) ||
       mlir::failed(
-          verifyGreedySelectedEClass(*egraph, *selection, "cheap", "arith.addi",
+          verifyGreedySelectedEClass(*egraph, selection, "cheap", "arith.addi",
                                      mlir::egraph::EGraphExtractCost(1),
                                      mlir::egraph::EGraphExtractCost(1))) ||
       mlir::failed(
-          verifyGreedySelectedEClass(*egraph, *selection, "root", "arith.muli",
+          verifyGreedySelectedEClass(*egraph, selection, "root", "arith.muli",
                                      mlir::egraph::EGraphExtractCost(4),
                                      mlir::egraph::EGraphExtractCost(5))) ||
       mlir::failed(
-          verifyGreedySelectedEClass(*egraph, *selection, "loop", "arith.muli",
+          verifyGreedySelectedEClass(*egraph, selection, "loop", "arith.muli",
                                      mlir::egraph::EGraphExtractCost(4),
                                      mlir::egraph::EGraphExtractCost(4))) ||
-      selection->rootCosts.size() != 3 || selection->rootCosts[0] != 5 ||
-      selection->rootCosts[1] != 4 || selection->rootCosts[2] != 1)
+      selection.rootCosts.size() != 3 || selection.rootCosts[0] != 5 ||
+      selection.rootCosts[1] != 4 || selection.rootCosts[2] != 1)
     return mlir::failure();
 
-  if (mlir::succeeded(findExtractSelection(*selection, "expensive")) ||
-      mlir::succeeded(findExtractSelection(*selection, "only_cycle")))
+  if (mlir::succeeded(findExtractSelection(selection, "expensive")) ||
+      mlir::succeeded(findExtractSelection(selection, "only_cycle")))
     return egraph->emitOpError(
         "greedy extract selected an unreachable or cyclic eclass");
 
@@ -577,13 +593,10 @@ mlir::LogicalResult verifyGreedyExtract(mlir::ModuleOp module,
       graph.getValue(onlyCycle.getSymNameAttr()),
       graph.getValue(loop.getSymNameAttr()),
       graph.getValue(aliasRoot.getSymNameAttr())};
-  mlir::FailureOr<mlir::egraph::EGraphExtractRequest> cyclicRequest =
-      mlir::egraph::buildEGraphExtractRequest(graph, *egraph, cyclicRoots);
-  if (mlir::failed(cyclicRequest))
-    return egraph->emitOpError("failed to build cyclic greedy request");
-
-  if (mlir::succeeded(mlir::egraph::extractEGraphGreedily(
-          graph, *egraph, *cyclicRequest, costModel)))
+  mlir::egraph::EGraphExtractInfo cyclicSelection;
+  if (mlir::succeeded(mlir::egraph::extractEGraphForTesting(
+          graph, *egraph, mlir::egraph::EGraphExtractMode::Greedy, costModel,
+          &cyclicSelection, cyclicRoots)))
     return onlyCycle.emitOpError(
         "greedy extract unexpectedly accepted a cyclic-only root");
 
@@ -609,24 +622,18 @@ verifyLinearProgrammingExtract(mlir::ModuleOp module,
     return egraph->emitOpError("expected @root1, @root2, @tie_root, "
                                "@input_alias_root, and @cycle symbols");
 
-  mlir::FailureOr<mlir::egraph::EGraphExtractRequest> request =
-      mlir::egraph::buildEGraphExtractRequest(
-          graph, *egraph, {},
-          mlir::egraph::EGraphExtractMode::LinearProgramming);
-  if (mlir::failed(request))
-    return egraph->emitOpError("failed to build LP extract request");
-
   llvm::SmallVector<mlir::StringAttr, 4> expectedRoots = {
       root1.getSymNameAttr(), root2.getSymNameAttr(), tieRoot.getSymNameAttr(),
       inputAliasRoot.getSymNameAttr()};
-  if (mlir::failed(verifyExtractRequestRoots(egraph->getOperation(), *request,
-                                             expectedRoots)))
-    return mlir::failure();
 
-  auto costModel = [](mlir::egraph::EOpRefBase candidate)
+  auto costModel = [](mlir::Operation *candidate)
       -> mlir::FailureOr<mlir::egraph::EGraphExtractCost> {
-    llvm::StringRef owner = candidate.getEClassOp().getSymName();
-    llvm::StringRef operationName = candidate.getOperationName();
+    auto ownerOp = llvm::dyn_cast_or_null<mlir::egraph::EClassOp>(
+        candidate->getBlock()->getParentOp());
+    if (!ownerOp)
+      return mlir::failure();
+    llvm::StringRef owner = ownerOp.getSymName();
+    llvm::StringRef operationName = candidate->getName().getStringRef();
     if (owner == "shared" && operationName == "arith.constant")
       return mlir::egraph::EGraphExtractCost(5);
     if ((owner == "a" || owner == "b") && operationName == "arith.constant")
@@ -646,22 +653,27 @@ verifyLinearProgrammingExtract(mlir::ModuleOp module,
     return mlir::failure();
   };
 
-  mlir::FailureOr<mlir::egraph::EGraphExtractResult> selection =
-      mlir::egraph::extractEGraphByLinearProgramming(graph, *egraph, *request,
-                                                     costModel);
-  if (mlir::failed(selection))
+  mlir::egraph::EGraphExtractInfo selection;
+  if (mlir::failed(mlir::egraph::extractEGraphForTesting(
+          graph, *egraph,
+          mlir::egraph::EGraphExtractMode::LinearProgramming, costModel,
+          &selection)))
     return egraph->emitOpError("failed to run LP extract");
 
-  if (selection->mode != mlir::egraph::EGraphExtractMode::LinearProgramming ||
-      selection->selectedEClasses.size() !=
-          selection->selectedCandidateRoots.size() ||
-      selection->selectedEClasses.size() !=
-          selection->selectedCandidateCosts.size() ||
-      selection->selectedEClasses.size() !=
-          selection->selectedSubtreeCosts.size() ||
-      selection->selectedAliasEClasses.size() !=
-          selection->selectedAliasTargets.size())
+  if (selection.mode != mlir::egraph::EGraphExtractMode::LinearProgramming ||
+      selection.selectedEClasses.size() !=
+          selection.selectedCandidateRoots.size() ||
+      selection.selectedEClasses.size() !=
+          selection.selectedCandidateCosts.size() ||
+      selection.selectedEClasses.size() !=
+          selection.selectedSubtreeCosts.size() ||
+      selection.selectedAliasEClasses.size() !=
+          selection.selectedAliasTargets.size())
     return egraph->emitOpError("unexpected LP extract result shape");
+
+  if (mlir::failed(verifyExtractRoots(egraph->getOperation(), selection.roots,
+                                      expectedRoots)))
+    return mlir::failure();
 
   llvm::SmallVector<llvm::StringRef, 4> expectedSelectedSymbols = {
       "shared", "root1", "root2", "tie_root"};
@@ -670,47 +682,47 @@ verifyLinearProgrammingExtract(mlir::ModuleOp module,
   llvm::SmallVector<llvm::StringRef, 2> expectedAliasTargets = {
       "x", "input_alias_leaf"};
   if (mlir::failed(verifyLinearProgrammingSelectionOrder(
-          *egraph, *selection, expectedSelectedSymbols)) ||
+          *egraph, selection, expectedSelectedSymbols)) ||
       mlir::failed(verifyLinearProgrammingAliasSelection(
-          *egraph, *selection, expectedAliasSymbols, expectedAliasTargets)) ||
+          *egraph, selection, expectedAliasSymbols, expectedAliasTargets)) ||
       mlir::failed(verifyLinearProgrammingSelectedEClass(
-          *egraph, *selection, "shared", "arith.constant",
+          *egraph, selection, "shared", "arith.constant",
           mlir::egraph::EGraphExtractCost(5),
           mlir::egraph::EGraphExtractCost(5))) ||
       mlir::failed(verifyLinearProgrammingSelectedEClass(
-          *egraph, *selection, "root1", "arith.muli",
+          *egraph, selection, "root1", "arith.muli",
           mlir::egraph::EGraphExtractCost(2),
           mlir::egraph::EGraphExtractCost(7))) ||
       mlir::failed(verifyLinearProgrammingSelectedEClass(
-          *egraph, *selection, "root2", "arith.addi",
+          *egraph, selection, "root2", "arith.addi",
           mlir::egraph::EGraphExtractCost(1),
           mlir::egraph::EGraphExtractCost(6))) ||
       mlir::failed(verifyLinearProgrammingSelectedEClass(
-          *egraph, *selection, "tie_root", "arith.addi",
+          *egraph, selection, "tie_root", "arith.addi",
           mlir::egraph::EGraphExtractCost(1),
           mlir::egraph::EGraphExtractCost(1))) ||
-      selection->rootCosts.size() != 4 || selection->rootCosts[0] != 7 ||
-      selection->rootCosts[1] != 6 || selection->rootCosts[2] != 1 ||
-      selection->rootCosts[3] != 0)
+      selection.rootCosts.size() != 4 || selection.rootCosts[0] != 7 ||
+      selection.rootCosts[1] != 6 || selection.rootCosts[2] != 1 ||
+      selection.rootCosts[3] != 0)
     return mlir::failure();
 
-  if (mlir::succeeded(findExtractSelection(*selection, "a")) ||
-      mlir::succeeded(findExtractSelection(*selection, "b")))
+  if (mlir::succeeded(findExtractSelection(selection, "a")) ||
+      mlir::succeeded(findExtractSelection(selection, "b")))
     return egraph->emitOpError(
         "LP extract selected a branch that is not globally optimal");
 
   mlir::egraph::EGraphExtractCost globalCost = 0;
-  for (mlir::egraph::EGraphExtractCost cost : selection->selectedCandidateCosts)
+  for (mlir::egraph::EGraphExtractCost cost : selection.selectedCandidateCosts)
     globalCost += cost;
   if (globalCost != 9)
     return egraph->emitOpError("LP extract selected global cost ")
            << globalCost << ", expected 9";
 
   egraph->emitRemark() << "lp extract root costs -> @root1="
-                       << selection->rootCosts[0]
-                       << ", @root2=" << selection->rootCosts[1]
-                       << ", @tie_root=" << selection->rootCosts[2]
-                       << ", @input_alias_root=" << selection->rootCosts[3]
+                       << selection.rootCosts[0]
+                       << ", @root2=" << selection.rootCosts[1]
+                       << ", @tie_root=" << selection.rootCosts[2]
+                       << ", @input_alias_root=" << selection.rootCosts[3]
                        << " global_cost=" << globalCost;
 
   llvm::SmallVector<mlir::egraph::EValue, 4> cyclicRoots = {
@@ -718,15 +730,11 @@ verifyLinearProgrammingExtract(mlir::ModuleOp module,
       graph.getValue(root2.getSymNameAttr()),
       graph.getValue(tieRoot.getSymNameAttr()),
       graph.getValue(inputAliasRoot.getSymNameAttr())};
-  mlir::FailureOr<mlir::egraph::EGraphExtractRequest> cyclicRequest =
-      mlir::egraph::buildEGraphExtractRequest(
-          graph, *egraph, cyclicRoots,
-          mlir::egraph::EGraphExtractMode::LinearProgramming);
-  if (mlir::failed(cyclicRequest))
-    return egraph->emitOpError("failed to build cyclic LP request");
-
-  if (mlir::succeeded(mlir::egraph::extractEGraphByLinearProgramming(
-          graph, *egraph, *cyclicRequest, costModel)))
+  mlir::egraph::EGraphExtractInfo cyclicSelection;
+  if (mlir::succeeded(mlir::egraph::extractEGraphForTesting(
+          graph, *egraph,
+          mlir::egraph::EGraphExtractMode::LinearProgramming, costModel,
+          &cyclicSelection, cyclicRoots)))
     return cycle.emitOpError("LP extract unexpectedly accepted a cyclic root");
 
   cycle.emitRemark() << "lp extract rejected cyclic root";
@@ -734,13 +742,13 @@ verifyLinearProgrammingExtract(mlir::ModuleOp module,
 }
 
 mlir::LogicalResult verifyLinearProgrammingSelectionOrder(
-    mlir::Operation *anchor, const mlir::egraph::EGraphExtractResult &selection,
+    mlir::Operation *anchor, const mlir::egraph::EGraphExtractInfo &selection,
     llvm::ArrayRef<llvm::StringRef> expectedSymbols) {
   return verifyExtractSelectionOrder(anchor, selection, expectedSymbols, "lp");
 }
 
 mlir::LogicalResult verifyLinearProgrammingAliasSelection(
-    mlir::Operation *anchor, const mlir::egraph::EGraphExtractResult &selection,
+    mlir::Operation *anchor, const mlir::egraph::EGraphExtractInfo &selection,
     llvm::ArrayRef<llvm::StringRef> expectedAliasSymbols,
     llvm::ArrayRef<llvm::StringRef> expectedAliasTargets) {
   return verifyExtractAliasSelection(anchor, selection, expectedAliasSymbols,
@@ -748,7 +756,7 @@ mlir::LogicalResult verifyLinearProgrammingAliasSelection(
 }
 
 mlir::LogicalResult verifyLinearProgrammingSelectedEClass(
-    mlir::Operation *anchor, const mlir::egraph::EGraphExtractResult &selection,
+    mlir::Operation *anchor, const mlir::egraph::EGraphExtractInfo &selection,
     llvm::StringRef symbolName, llvm::StringRef operationName,
     mlir::egraph::EGraphExtractCost expectedLocalCost,
     mlir::egraph::EGraphExtractCost expectedSubtreeCost) {
@@ -765,23 +773,19 @@ verifyGreedyExtractMaterialization(mlir::ModuleOp module,
   if (mlir::failed(egraph))
     return module.emitError("expected one active egraph.egraph");
 
-  mlir::FailureOr<mlir::egraph::EGraphExtractRequest> request =
-      mlir::egraph::buildEGraphExtractRequest(graph, *egraph);
-  if (mlir::failed(request))
-    return egraph->emitOpError("failed to build greedy extract request");
-
-  auto costModel = [](mlir::egraph::EOpRefBase candidate)
+  auto costModel = [](mlir::Operation *candidate)
       -> mlir::FailureOr<mlir::egraph::EGraphExtractCost> {
-    llvm::StringRef operationName = candidate.getOperationName();
+    llvm::StringRef operationName = candidate->getName().getStringRef();
     if (operationName == "arith.addi" || operationName == "arith.muli" ||
         operationName == "arith.subi")
       return mlir::egraph::EGraphExtractCost(1);
     return mlir::failure();
   };
 
-  mlir::FailureOr<mlir::egraph::EGraphExtractResult> selection =
-      mlir::egraph::extractEGraphGreedily(graph, *egraph, *request, costModel);
-  if (mlir::failed(selection))
+  mlir::egraph::EGraphExtractInfo selection;
+  if (mlir::failed(mlir::egraph::extractEGraphForTesting(
+          graph, *egraph, mlir::egraph::EGraphExtractMode::Greedy, costModel,
+          &selection)))
     return egraph->emitOpError(
         "failed to run greedy extract for materialization");
 
@@ -804,12 +808,12 @@ verifyGreedyExtractMaterialization(mlir::ModuleOp module,
   llvm::SmallVector<mlir::Value, 4> inputValues(
       entryBlock->getArguments().begin(), entryBlock->getArguments().end());
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> roots =
-      mlir::egraph::materializeEGraphExtractResult(graph, *egraph, *selection,
-                                                   builder, inputValues);
+      mlir::egraph::materializeEGraphExtractInfoForTesting(
+          graph, *egraph, selection, builder, inputValues);
   if (mlir::failed(roots))
     return egraph->emitOpError("failed to materialize extracted roots");
 
-  if (roots->size() != selection->roots.size())
+  if (roots->size() != selection.roots.size())
     return egraph->emitOpError("materialized root count diverged");
 
   mlir::func::ReturnOp::create(builder, egraph->getLoc(), *roots);
@@ -3605,15 +3609,15 @@ mlir::LogicalResult verifyWorklistDriverIterationLimit(
   unsigned initialRefCount = graph.getOpRefs().size();
   unsigned initialEClassCount = countEClasses(clonedModule);
 
-  mlir::egraph::EGraphRewriteDriverConfig config;
+  mlir::egraph::EGraphMatchConfig config;
   config.maxIterations = 1;
 
-  mlir::FailureOr<mlir::egraph::EGraphRewriteDriverResult> driven =
+  mlir::FailureOr<mlir::egraph::EGraphMatchStats> driven =
       mlir::egraph::applyEGraphPatterns(graph, patterns, clonedModule, config);
   if (mlir::failed(driven))
     return module.emitError("limited worklist driver failed");
   if (!driven->limitReached ||
-      driven->reachedLimit != mlir::egraph::EGraphRewriteDriverLimit::Iteration)
+      driven->reachedLimit != mlir::egraph::EGraphMatchLimit::Iteration)
     return module.emitError("worklist driver did not report iteration limit");
   if (driven->iterations != 1)
     return module.emitError("worklist driver used unexpected iteration count");
@@ -3644,15 +3648,15 @@ mlir::LogicalResult verifyWorklistDriverCandidateLimit(
     return module.emitError("expected at least two initial candidate roots");
   unsigned initialEClassCount = countEClasses(clonedModule);
 
-  mlir::egraph::EGraphRewriteDriverConfig config;
+  mlir::egraph::EGraphMatchConfig config;
   config.maxEnqueuedCandidates = initialRefCount - 1;
 
-  mlir::FailureOr<mlir::egraph::EGraphRewriteDriverResult> driven =
+  mlir::FailureOr<mlir::egraph::EGraphMatchStats> driven =
       mlir::egraph::applyEGraphPatterns(graph, patterns, clonedModule, config);
   if (mlir::failed(driven))
     return module.emitError("candidate-limited worklist driver failed");
   if (!driven->limitReached ||
-      driven->reachedLimit != mlir::egraph::EGraphRewriteDriverLimit::Candidate)
+      driven->reachedLimit != mlir::egraph::EGraphMatchLimit::Candidate)
     return module.emitError("worklist driver did not report candidate limit");
   if (driven->iterations != 0)
     return module.emitError(
@@ -3684,15 +3688,15 @@ verifySymbolicWorklistDriverRebuildLimit(mlir::ModuleOp module) {
     return mlir::failure();
 
   mlir::egraph::EGraphPatternSet patterns;
-  mlir::egraph::EGraphRewriteDriverConfig config;
+  mlir::egraph::EGraphMatchConfig config;
   config.maxRebuilds = 1;
 
-  mlir::FailureOr<mlir::egraph::EGraphRewriteDriverResult> driven =
+  mlir::FailureOr<mlir::egraph::EGraphMatchStats> driven =
       mlir::egraph::applyEGraphPatterns(graph, patterns, clonedModule, config);
   if (mlir::failed(driven))
     return module.emitError("rebuild-limited worklist driver failed");
   if (!driven->limitReached ||
-      driven->reachedLimit != mlir::egraph::EGraphRewriteDriverLimit::Rebuild)
+      driven->reachedLimit != mlir::egraph::EGraphMatchLimit::Rebuild)
     return module.emitError("worklist driver did not report rebuild limit");
   if (!graph.isClean())
     return module.emitError(
@@ -3724,16 +3728,16 @@ mlir::LogicalResult verifyWorklistDriver(mlir::ModuleOp module,
 
   std::string debugTraceStorage;
   llvm::raw_string_ostream debugTrace(debugTraceStorage);
-  mlir::egraph::EGraphRewriteDriverConfig config;
+  mlir::egraph::EGraphMatchConfig config;
   config.debugStream = &debugTrace;
 
-  mlir::FailureOr<mlir::egraph::EGraphRewriteDriverResult> driven =
+  mlir::FailureOr<mlir::egraph::EGraphMatchStats> driven =
       mlir::egraph::applyEGraphPatterns(graph, patterns, module, config);
   if (mlir::failed(driven))
     return module.emitError("worklist driver failed");
   debugTrace.flush();
   if (driven->limitReached ||
-      driven->reachedLimit != mlir::egraph::EGraphRewriteDriverLimit::None)
+      driven->reachedLimit != mlir::egraph::EGraphMatchLimit::None)
     return module.emitError("worklist driver unexpectedly hit a limit");
   if (!driven->changed || driven->changedCommits == 0)
     return module.emitError("worklist driver did not commit a changed rewrite");
@@ -3810,10 +3814,10 @@ mlir::LogicalResult verifySymbolicWorklistDriver(mlir::ModuleOp module,
 
   std::string debugTraceStorage;
   llvm::raw_string_ostream debugTrace(debugTraceStorage);
-  mlir::egraph::EGraphRewriteDriverConfig config;
+  mlir::egraph::EGraphMatchConfig config;
   config.debugStream = &debugTrace;
 
-  mlir::FailureOr<mlir::egraph::EGraphRewriteDriverResult> driven =
+  mlir::FailureOr<mlir::egraph::EGraphMatchStats> driven =
       mlir::egraph::applyEGraphPatterns(graph, patterns, module, config);
   if (mlir::failed(driven))
     return module.emitError("symbolic worklist driver failed");
@@ -3821,7 +3825,7 @@ mlir::LogicalResult verifySymbolicWorklistDriver(mlir::ModuleOp module,
   if (!graph.isClean())
     return module.emitError("symbolic worklist driver left a dirty graph");
   if (driven->limitReached ||
-      driven->reachedLimit != mlir::egraph::EGraphRewriteDriverLimit::None)
+      driven->reachedLimit != mlir::egraph::EGraphMatchLimit::None)
     return module.emitError(
         "symbolic worklist driver unexpectedly hit a limit");
   if (!driven->changed || driven->changedCommits == 0)
@@ -4064,6 +4068,20 @@ private:
   unsigned &matchCount;
 };
 
+mlir::FailureOr<mlir::egraph::EGraphExtractCost>
+getDemoExtractCost(mlir::Operation *candidate) {
+  llvm::StringRef operationName = candidate->getName().getStringRef();
+  if (operationName == mlir::arith::ConstantOp::getOperationName())
+    return mlir::egraph::EGraphExtractCost(1);
+  if (operationName == mlir::arith::ShLIOp::getOperationName())
+    return mlir::egraph::EGraphExtractCost(1);
+  if (operationName == mlir::arith::MulIOp::getOperationName())
+    return mlir::egraph::EGraphExtractCost(4);
+  if (operationName == mlir::arith::DivSIOp::getOperationName())
+    return mlir::egraph::EGraphExtractCost(8);
+  return mlir::egraph::EGraphExtractCost(16);
+}
+
 mlir::LogicalResult runImportedPipeline(mlir::ModuleOp module) {
   auto demoFunc = module.lookupSymbol<mlir::func::FuncOp>("arith_demo");
   if (!demoFunc)
@@ -4108,7 +4126,7 @@ mlir::LogicalResult runImportedPipeline(mlir::ModuleOp module) {
   patterns.add<DemoDivSelfToOnePattern>(divSelfMatches);
   patterns.add<DemoMulByOneToAliasPattern>(mulByOneMatches);
 
-  mlir::FailureOr<mlir::egraph::EGraphRewriteDriverResult> driven =
+  mlir::FailureOr<mlir::egraph::EGraphMatchStats> driven =
       mlir::egraph::applyEGraphPatterns(graph, patterns, module);
   if (mlir::failed(driven))
     return module.emitError("egraph pipeline driver failed");
@@ -4179,6 +4197,46 @@ mlir::LogicalResult runImportedPipeline(mlir::ModuleOp module) {
   return mlir::success();
 }
 
+mlir::LogicalResult runMatchAndExtractPipeline(mlir::ModuleOp module) {
+  auto demoFunc = module.lookupSymbol<mlir::func::FuncOp>("arith_demo");
+  if (!demoFunc)
+    return module.emitError("expected a demo func.func named @arith_demo");
+
+  unsigned mulByTwoMatches = 0;
+  unsigned reassociateMatches = 0;
+  unsigned divSelfMatches = 0;
+  unsigned mulByOneMatches = 0;
+  mlir::egraph::EGraphPatternSet patterns;
+  patterns.add<DemoMulByTwoToShiftPattern>(mulByTwoMatches);
+  patterns.add<DemoReassociateDivPattern>(reassociateMatches);
+  patterns.add<DemoDivSelfToOnePattern>(divSelfMatches);
+  patterns.add<DemoMulByOneToAliasPattern>(mulByOneMatches);
+
+  mlir::Block &block = demoFunc.getBody().front();
+  if (mlir::failed(mlir::egraph::applyEGraphPatternsAndExtract(
+          block, patterns, mlir::egraph::EGraphExtractMode::Greedy,
+          getDemoExtractCost)))
+    return module.emitError("egraph match/extract pipeline failed");
+
+  if (mulByTwoMatches == 0 || reassociateMatches == 0 ||
+      divSelfMatches == 0 || mulByOneMatches == 0)
+    return module.emitError(
+        "egraph match/extract did not exercise all demo patterns");
+
+  auto returnOp = llvm::dyn_cast_or_null<mlir::func::ReturnOp>(
+      block.getTerminator());
+  if (!returnOp || returnOp.getNumOperands() != 1 ||
+      returnOp.getOperand(0) != block.getArgument(0))
+    return module.emitError(
+        "egraph match/extract did not simplify the demo root to arg0");
+  if (block.getOperations().size() != 1)
+    return module.emitError(
+        "egraph match/extract left redundant operations in the demo block");
+
+  module.emitRemark() << "egraph pipeline matched and extracted arith demo";
+  return mlir::success();
+}
+
 mlir::LogicalResult runImportedFoldPipeline(mlir::ModuleOp module) {
   auto foldFunc = module.lookupSymbol<mlir::func::FuncOp>("fold_demo");
   auto foldValueFunc =
@@ -4233,7 +4291,7 @@ mlir::LogicalResult runImportedFoldPipeline(mlir::ModuleOp module) {
         "expected imported fold demo egraph to start clean");
 
   mlir::egraph::EGraphPatternSet patterns;
-  mlir::FailureOr<mlir::egraph::EGraphRewriteDriverResult> disabledDriven =
+  mlir::FailureOr<mlir::egraph::EGraphMatchStats> disabledDriven =
       mlir::egraph::applyEGraphPatterns(constGraph, patterns, module);
   if (mlir::failed(disabledDriven))
     return module.emitError("disabled fold driver failed");
@@ -4245,13 +4303,13 @@ mlir::LogicalResult runImportedFoldPipeline(mlir::ModuleOp module) {
   module.emitRemark() << "egraph fold stayed disabled by default in @"
                       << constAddiName.getValue();
 
-  mlir::egraph::EGraphRewriteDriverConfig config;
+  mlir::egraph::EGraphMatchConfig config;
   config.enableMlirFold = true;
 
   unsigned conflictingPatternMatches = 0;
   patterns.add<FoldConflictAddToAliasPattern>(conflictingPatternMatches);
 
-  mlir::FailureOr<mlir::egraph::EGraphRewriteDriverResult> driven =
+  mlir::FailureOr<mlir::egraph::EGraphMatchStats> driven =
       mlir::egraph::applyEGraphPatterns(constGraph, patterns, module, config);
   if (mlir::failed(driven))
     return module.emitError("enabled fold driver failed");
@@ -4284,7 +4342,7 @@ mlir::LogicalResult runImportedFoldPipeline(mlir::ModuleOp module) {
         "expected imported value fold demo egraph to start clean");
 
   mlir::egraph::EGraphPatternSet valuePatterns;
-  mlir::FailureOr<mlir::egraph::EGraphRewriteDriverResult> valueDriven =
+  mlir::FailureOr<mlir::egraph::EGraphMatchStats> valueDriven =
       mlir::egraph::applyEGraphPatterns(valueGraph, valuePatterns, module,
                                         config);
   if (mlir::failed(valueDriven))
@@ -4315,7 +4373,7 @@ mlir::LogicalResult runImportedFoldPipeline(mlir::ModuleOp module) {
         "expected imported in-place fold demo egraph to start clean");
 
   mlir::egraph::EGraphPatternSet inPlacePatterns;
-  mlir::FailureOr<mlir::egraph::EGraphRewriteDriverResult> inPlaceDriven =
+  mlir::FailureOr<mlir::egraph::EGraphMatchStats> inPlaceDriven =
       mlir::egraph::applyEGraphPatterns(inPlaceGraph, inPlacePatterns, module,
                                         config);
   if (mlir::failed(inPlaceDriven))
@@ -4372,6 +4430,32 @@ struct TestEGraphPipelinePass
   }
 };
 
+struct TestEGraphMatchAndExtractPipelinePass
+    : public mlir::PassWrapper<TestEGraphMatchAndExtractPipelinePass,
+                               mlir::OperationPass<mlir::ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
+      TestEGraphMatchAndExtractPipelinePass)
+
+  llvm::StringRef getArgument() const final {
+    return "test-egraph-match-and-extract";
+  }
+
+  llvm::StringRef getDescription() const final {
+    return "test MLIR-EGraph imported match and extract pipeline";
+  }
+
+  void getDependentDialects(mlir::DialectRegistry &registry) const final {
+    registry.insert<mlir::arith::ArithDialect>();
+    registry.insert<mlir::egraph::EGraphDialect>();
+    registry.insert<mlir::func::FuncDialect>();
+  }
+
+  void runOnOperation() final {
+    if (mlir::failed(runMatchAndExtractPipeline(getOperation())))
+      signalPassFailure();
+  }
+};
+
 struct TestEGraphMlirFoldPass
     : public mlir::PassWrapper<TestEGraphMlirFoldPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -4395,17 +4479,17 @@ struct TestEGraphMlirFoldPass
   }
 };
 
-struct TestEGraphExtractRequestPass
-    : public mlir::PassWrapper<TestEGraphExtractRequestPass,
+struct TestEGraphExtractInfoPass
+    : public mlir::PassWrapper<TestEGraphExtractInfoPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(TestEGraphExtractRequestPass)
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(TestEGraphExtractInfoPass)
 
   llvm::StringRef getArgument() const final {
-    return "test-egraph-extract-request";
+    return "test-egraph-extract-info";
   }
 
   llvm::StringRef getDescription() const final {
-    return "test normalized graph extract request selection";
+    return "test normalized graph extract info selection";
   }
 
   void getDependentDialects(mlir::DialectRegistry &registry) const final {
@@ -4418,7 +4502,7 @@ struct TestEGraphExtractRequestPass
     mlir::egraph::EGraph graph;
     mlir::LogicalResult result = indexTestGraph(module, graph);
     if (mlir::succeeded(result))
-      result = verifyExtractRequestSemantics(module, graph);
+      result = verifyExtractInfoSemantics(module, graph);
 
     if (mlir::failed(result))
       signalPassFailure();
@@ -4858,8 +4942,9 @@ struct TestEGraphWorklistDriverPass
 
 void registerEGraphTestPasses() {
   mlir::PassRegistration<TestEGraphPipelinePass>();
+  mlir::PassRegistration<TestEGraphMatchAndExtractPipelinePass>();
   mlir::PassRegistration<TestEGraphMlirFoldPass>();
-  mlir::PassRegistration<TestEGraphExtractRequestPass>();
+  mlir::PassRegistration<TestEGraphExtractInfoPass>();
   mlir::PassRegistration<TestEGraphExtractCostModelPass>();
   mlir::PassRegistration<TestEGraphGreedyExtractPass>();
   mlir::PassRegistration<TestEGraphLinearProgrammingExtractPass>();

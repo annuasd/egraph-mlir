@@ -6,6 +6,8 @@
 namespace mlir {
 namespace egraph {
 
+class GraphMatchState;
+
 enum class EGraphExtractMode {
   Greedy,
   LinearProgramming,
@@ -14,19 +16,12 @@ enum class EGraphExtractMode {
 /// Scalar cost assigned to a single candidate occurrence.
 using EGraphExtractCost = uint64_t;
 
-/// Cost model for a single candidate occurrence.
+/// Cost model for a single candidate operation.
 using EGraphExtractCostModel =
-    llvm::function_ref<FailureOr<EGraphExtractCost>(EOpRefBase)>;
-
-/// Normalized extractor input shared by all extraction backends.
-struct EGraphExtractRequest {
-  EGraphExtractMode mode = EGraphExtractMode::Greedy;
-  /// Ordered by egraph result slot.
-  SmallVector<EValue, 4> roots;
-};
+    llvm::function_ref<FailureOr<EGraphExtractCost>(Operation *)>;
 
 /// Candidate selection summary produced by an extraction backend.
-struct EGraphExtractResult {
+struct EGraphExtractInfo {
   EGraphExtractMode mode = EGraphExtractMode::Greedy;
   /// Ordered by egraph result slot.
   SmallVector<EValue, 4> roots;
@@ -50,47 +45,12 @@ struct EGraphExtractResult {
 /// Formats an extraction mode for diagnostics and debug output.
 StringRef stringifyEGraphExtractMode(EGraphExtractMode mode);
 
-/// Builds a normalized extract request from explicit roots, or from the
-/// enclosing `egraph.return` targets when explicit roots are empty.
-///
-/// Extraction is a post-saturation phase, so request construction rejects dirty
-/// graphs. Returned roots are leader-normalized, symbol-backed EValues ordered
-/// by egraph result slot.
-FailureOr<EGraphExtractRequest>
-buildEGraphExtractRequest(EGraph &graph, EGraphOp egraph,
-                          ArrayRef<EValue> explicitRoots = {},
-                          EGraphExtractMode mode = EGraphExtractMode::Greedy);
-
-/// Selects the lowest-cost candidate root for each requested result slot.
-/// The graph must already be clean, and the request roots must already be
-/// normalized.
-FailureOr<EGraphExtractResult>
-selectEGraphExtractCandidates(EGraph &graph,
-                              const EGraphExtractRequest &request,
-                              EGraphExtractCostModel costModel);
-
-/// Extracts a greedy candidate selection for the requested result graph.
-/// The graph must already be clean, and the request must use greedy mode.
-FailureOr<EGraphExtractResult>
-extractEGraphGreedily(EGraph &graph, EGraphOp egraph,
-                      const EGraphExtractRequest &request,
-                      EGraphExtractCostModel costModel);
-
-/// Extracts a globally optimal candidate selection for the requested result
-/// graph using the Z3-backed linear programming backend.
-/// The graph must already be clean, and the request must use LP mode.
-FailureOr<EGraphExtractResult>
-extractEGraphByLinearProgramming(EGraph &graph, EGraphOp egraph,
-                                 const EGraphExtractRequest &request,
-                                 EGraphExtractCostModel costModel);
-
-/// Materializes the selected extraction result into ordinary MLIR values.
-/// `inputValues` are ordered like the enclosing egraph entry arguments.
-/// Shared selected e-classes are cloned once and reused by all roots.
-FailureOr<SmallVector<Value, 4>>
-materializeEGraphExtractResult(EGraph &graph, EGraphOp egraph,
-                               const EGraphExtractResult &selection,
-                               OpBuilder &builder, ArrayRef<Value> inputValues);
+/// Updates the original block in place by extracting from the rewritten state.
+/// Explicit roots default to the enclosing egraph return targets.
+LogicalResult extractEGraph(GraphMatchState &state, EGraphExtractMode mode,
+                            EGraphExtractCostModel costModel,
+                            ArrayRef<EValue> explicitRoots = {},
+                            EGraphExtractInfo *info = nullptr);
 
 } // namespace egraph
 } // namespace mlir

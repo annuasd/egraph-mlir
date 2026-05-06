@@ -1,8 +1,8 @@
-// RUN: mlir-egraph-opt %s --test-egraph-extract-request 2>&1 | FileCheck %s
+// RUN: mlir-egraph-opt %s --test-egraph-extract-info 2>&1 | FileCheck %s
 
 module {
   // Exercise default root selection, explicit root overrides, and dirty-graph rejection.
-  egraph.egraph @extract_request(%x: i32) -> (i32, i32) {
+  egraph.egraph @extract_info(%x: i32) -> (i32, i32) {
     egraph.input @x = %x : i32
 
     egraph.eclass @lhs : i32 {
@@ -29,6 +29,6 @@ module {
   }
 }
 
-// CHECK-DAG: remark: extract request default roots -> @rhs, @user mode=greedy
-// CHECK-DAG: remark: extract request explicit roots -> @lhs, @user mode=lp
-// CHECK-DAG: remark: extract request rejected dirty graph
+// CHECK-DAG: remark: extract info default roots -> @rhs, @user mode=greedy
+// CHECK-DAG: remark: extract info explicit roots -> @lhs, @user mode=lp
+// CHECK-DAG: remark: extract info rejected dirty graph

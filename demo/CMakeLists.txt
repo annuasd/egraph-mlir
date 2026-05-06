@@ -6,7 +6,6 @@ add_mlir_tool(mlir-egraph-demo
   demo.cpp
 
   DEPENDS
-  EGraphConversion
   EGraph
   EGraphIR
 )
@@ -16,7 +15,6 @@ target_compile_definitions(mlir-egraph-demo PRIVATE
 )
 
 target_link_libraries(mlir-egraph-demo PRIVATE
-  EGraphConversion
   EGraph
   EGraphIR
   MLIRArithDialect

@@ -2,8 +2,10 @@
 #define MLIR_EGRAPH_EGRAPH_PATTERN_H
 
 #include "MLIREGraph/EGraph/EGraph.h"
+#include "MLIREGraph/EGraph/Extract.h"
 #include "mlir/IR/Block.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/OwningOpRef.h"
 #include "mlir/IR/ValueRange.h"
 #include "mlir/Support/LLVM.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -18,6 +20,8 @@
 
 namespace mlir {
 namespace egraph {
+
+class EGraphPatternSet;
 
 enum class EGraphRewriteEventKind {
   /// Records a replacement event for the root candidate.
@@ -60,15 +64,15 @@ struct EGraphRewriteCommitResult {
   SmallVector<EOpRefBase, 4> affectedParentCandidates;
 };
 
-enum class EGraphRewriteDriverLimit {
+enum class EGraphMatchLimit {
   None,
   Iteration,
   Candidate,
   Rebuild,
 };
 
-/// Driver limits and tracing knobs. Zero-valued limits mean unlimited.
-struct EGraphRewriteDriverConfig {
+/// Match limits and tracing knobs. Zero-valued limits mean unlimited.
+struct EGraphMatchConfig {
   unsigned maxIterations = 0;
   unsigned maxEnqueuedCandidates = 0;
   unsigned maxRebuilds = 0;
@@ -78,17 +82,52 @@ struct EGraphRewriteDriverConfig {
   llvm::raw_ostream *debugStream = nullptr;
 };
 
-/// Summary of a driver run.
-struct EGraphRewriteDriverResult {
+/// Summary of a match run.
+struct EGraphMatchStats {
   bool changed = false;
   bool limitReached = false;
-  EGraphRewriteDriverLimit reachedLimit = EGraphRewriteDriverLimit::None;
+  EGraphMatchLimit reachedLimit = EGraphMatchLimit::None;
   unsigned iterations = 0;
   unsigned enqueuedCandidates = 0;
   unsigned skippedStaleRefs = 0;
   unsigned matchedPatterns = 0;
   unsigned changedCommits = 0;
   unsigned rebuilds = 0;
+};
+
+/// Move-only state produced by applying match patterns to a block.
+class GraphMatchState {
+public:
+  GraphMatchState() = delete;
+  GraphMatchState(GraphMatchState &&) = default;
+  GraphMatchState &operator=(GraphMatchState &&) = default;
+  GraphMatchState(const GraphMatchState &) = delete;
+  GraphMatchState &operator=(const GraphMatchState &) = delete;
+
+  Block &getBlock() const;
+  const EGraphMatchStats &getStats() const;
+
+private:
+  friend FailureOr<GraphMatchState>
+  applyEGraphPatterns(Block &block, const EGraphPatternSet &patterns,
+                      const EGraphMatchConfig &config);
+  friend LogicalResult extractEGraph(GraphMatchState &state,
+                                     EGraphExtractMode mode,
+                                     EGraphExtractCostModel costModel,
+                                     ArrayRef<EValue> explicitRoots,
+                                     EGraphExtractInfo *info);
+  friend LogicalResult applyEGraphPatternsAndExtract(
+      Block &block, const EGraphPatternSet &patterns, EGraphExtractMode mode,
+      EGraphExtractCostModel costModel, const EGraphMatchConfig &config);
+
+  GraphMatchState(Block &block, std::unique_ptr<EGraph> graph,
+                  OwningOpRef<Operation *> egraphOp, EGraphMatchStats stats);
+
+  Block *block = nullptr;
+  std::unique_ptr<EGraph> graph;
+  OwningOpRef<Operation *> egraphOp;
+  EGraphMatchStats stats;
+  bool extracted = false;
 };
 
 class EGraphRewriteTransaction {
@@ -255,21 +294,20 @@ private:
   llvm::StringMap<SmallVector<EGraphPattern *>> patternsByRoot;
 };
 
-FailureOr<EGraphRewriteDriverResult>
-applyEGraphPatterns(EGraph &graph, const EGraphPatternSet &patterns,
-                    Operation *rebuildRoot);
+FailureOr<GraphMatchState>
+applyEGraphPatterns(Block &block, const EGraphPatternSet &patterns,
+                    const EGraphMatchConfig &config = {});
 
-/// Applies the given pattern set with an explicit driver configuration.
-FailureOr<EGraphRewriteDriverResult>
-applyEGraphPatterns(EGraph &graph, const EGraphPatternSet &patterns,
-                    Operation *rebuildRoot,
-                    const EGraphRewriteDriverConfig &config);
+LogicalResult applyEGraphPatternsAndExtract(
+    Block &block, const EGraphPatternSet &patterns, EGraphExtractMode mode,
+    EGraphExtractCostModel costModel,
+    const EGraphMatchConfig &config = {});
 
-/// Formats a driver limit for diagnostics.
-StringRef stringifyEGraphRewriteDriverLimit(EGraphRewriteDriverLimit limit);
-/// Prints a driver result to the given stream.
-void printEGraphRewriteDriverResult(llvm::raw_ostream &os,
-                                    const EGraphRewriteDriverResult &result);
+/// Formats a match limit for diagnostics.
+StringRef stringifyEGraphMatchLimit(EGraphMatchLimit limit);
+/// Prints match stats to the given stream.
+void printEGraphMatchStats(llvm::raw_ostream &os,
+                           const EGraphMatchStats &stats);
 
 } // namespace egraph
 } // namespace mlir

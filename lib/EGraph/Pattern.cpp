@@ -1,11 +1,20 @@
 #include "MLIREGraph/EGraph/Pattern.h"
 
+#include "mlir/Interfaces/CallInterfaces.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/IR/OpImplementation.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/FoldInterfaces.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/Twine.h"
 #include "llvm/Support/DebugLog.h"
 #include "llvm/Support/ErrorHandling.h"
 #include <cassert>
@@ -14,6 +23,17 @@ using namespace mlir;
 using namespace mlir::egraph;
 
 #define DEBUG_TYPE "egraph-pattern"
+
+namespace mlir {
+namespace egraph {
+FailureOr<EGraphMatchStats>
+applyEGraphPatterns(EGraph &graph, const EGraphPatternSet &patterns,
+                    Operation *rebuildRoot, const EGraphMatchConfig &config);
+FailureOr<EGraphMatchStats>
+applyEGraphPatterns(EGraph &graph, const EGraphPatternSet &patterns,
+                    Operation *rebuildRoot);
+} // namespace egraph
+} // namespace mlir
 
 namespace {
 Type getEventValuePayloadType(Value value) { return value.getType(); }
@@ -69,6 +89,274 @@ void printDriverStructuralKey(raw_ostream &os, const EGraphStructuralKey &key) {
   os << "{op=" << key.operationName.getStringRef() << ", child_leader_symbols=";
   printDriverDebugSymbols(os, key.childLeaderSymbols);
   os << '}';
+}
+
+StringRef getLeafOperationName(Operation *op) {
+  StringRef fullName = op->getName().getStringRef();
+  auto split = fullName.rsplit('.');
+  return split.second.empty() ? split.first : split.second;
+}
+
+std::string sanitizeSymbolStem(StringRef stem) {
+  SmallString<64> sanitized;
+  for (char ch : stem) {
+    if (llvm::isAlnum(static_cast<unsigned char>(ch)) || ch == '_') {
+      sanitized.push_back(ch);
+      continue;
+    }
+
+    if (sanitized.empty() || sanitized.back() == '_')
+      continue;
+    sanitized.push_back('_');
+  }
+
+  while (!sanitized.empty() && sanitized.back() == '_')
+    sanitized.pop_back();
+
+  if (sanitized.empty())
+    return "sym";
+  if (llvm::isDigit(static_cast<unsigned char>(sanitized.front())))
+    return (Twine("s") + sanitized).str();
+  return sanitized.str().str();
+}
+
+std::string getAsmResultName(Operation *op, unsigned resultIndex) {
+  if (resultIndex >= op->getNumResults())
+    return {};
+
+  std::string name;
+  if (auto asmInterface = dyn_cast<OpAsmOpInterface>(op)) {
+    asmInterface.getAsmResultNames([&](Value value, StringRef candidate) {
+      if (value == op->getResult(resultIndex) && !candidate.empty())
+        name = candidate.str();
+    });
+  }
+  return name;
+}
+
+class DeterministicSymbolNamer {
+public:
+  explicit DeterministicSymbolNamer(Operation *symbolTableOp)
+      : symbolTableOp(symbolTableOp) {}
+
+  std::string claim(StringRef preferredStem) {
+    std::string base = sanitizeSymbolStem(preferredStem);
+    auto isTaken = [&](StringRef candidate) {
+      return reservedNames.contains(candidate) ||
+             SymbolTable::lookupSymbolIn(symbolTableOp, candidate);
+    };
+
+    std::string candidate = base;
+    if (isTaken(candidate)) {
+      unsigned &suffix = nextSuffixByStem[base];
+      do {
+        candidate = (Twine(base) + "_" + Twine(suffix++)).str();
+      } while (isTaken(candidate));
+    }
+
+    reservedNames.insert(candidate);
+    return candidate;
+  }
+
+private:
+  Operation *symbolTableOp;
+  llvm::StringSet<> reservedNames;
+  llvm::StringMap<unsigned> nextSuffixByStem;
+};
+
+FailureOr<EClassOp> importOperationToEClass(
+    Operation *op, OpBuilder &builder, DeterministicSymbolNamer &namer,
+    DenseMap<Value, FlatSymbolRefAttr> &importedSymbols) {
+  if (op->getNumResults() != 1)
+    return op->emitOpError(
+        "block import currently supports only single-result pure operations");
+
+  SmallVector<Attribute> childRefs;
+  childRefs.reserve(op->getNumOperands());
+  for (OpOperand &operand : op->getOpOperands()) {
+    auto symbolIt = importedSymbols.find(operand.get());
+    if (symbolIt == importedSymbols.end())
+      return op->emitOpError("operand #")
+             << operand.getOperandNumber()
+             << " has not been imported into the temporary egraph";
+    childRefs.push_back(symbolIt->second);
+  }
+
+  Value result = op->getResult(0);
+  std::string eclassName = namer.claim(getAsmResultName(op, 0).empty()
+                                           ? getLeafOperationName(op)
+                                           : getAsmResultName(op, 0));
+  auto nameAttr = builder.getStringAttr(eclassName);
+  auto eclass = EClassOp::create(
+      builder, op->getLoc(), nameAttr, TypeAttr::get(result.getType()),
+      builder.getArrayAttr({builder.getArrayAttr(childRefs)}),
+      /*candidatesCount=*/1);
+  Region &candidate = eclass.getCandidates().front();
+  Block *candidateBlock = new Block();
+  candidate.push_back(candidateBlock);
+
+  IRMapping mapping;
+  for (OpOperand &operand : op->getOpOperands()) {
+    BlockArgument candidateArg =
+        candidateBlock->addArgument(operand.get().getType(), op->getLoc());
+    mapping.map(operand.get(), candidateArg);
+  }
+
+  OpBuilder candidateBuilder = OpBuilder::atBlockBegin(candidateBlock);
+  Operation *clonedOp = candidateBuilder.clone(*op, mapping);
+  YieldOp::create(candidateBuilder, op->getLoc(), clonedOp->getResult(0));
+
+  importedSymbols.try_emplace(result, FlatSymbolRefAttr::get(nameAttr));
+  return eclass;
+}
+
+LogicalResult verifyOperandIsBlockLocal(Operation *op, OpOperand &operand,
+                                        Block &block) {
+  Value value = operand.get();
+  if (auto blockArg = dyn_cast<BlockArgument>(value)) {
+    if (blockArg.getOwner() == &block)
+      return success();
+
+    return op->emitOpError("operand #")
+           << operand.getOperandNumber()
+           << " uses a block argument from another block; cross-block values "
+              "are not supported by block import";
+  }
+
+  Operation *definingOp = value.getDefiningOp();
+  if (definingOp && definingOp->getBlock() == &block)
+    return success();
+
+  return op->emitOpError("operand #")
+         << operand.getOperandNumber()
+         << " uses a value from another block; cross-block values are not "
+            "supported by block import";
+}
+
+LogicalResult verifyResultUsersAreBlockLocal(Operation *op, Block &block) {
+  for (auto indexedResult : llvm::enumerate(op->getResults())) {
+    if (!indexedResult.value().isUsedOutsideOfBlock(&block))
+      continue;
+
+    return op->emitOpError("result #")
+           << indexedResult.index()
+           << " is used outside the defining block; cross-block values are not "
+              "supported by block import";
+  }
+
+  return success();
+}
+
+LogicalResult verifyOperationIsEligibleForImport(Operation *op, Block &block) {
+  if (op->getNumSuccessors() != 0 || isa<BranchOpInterface>(op) ||
+      isa<RegionBranchOpInterface>(op))
+    return op->emitOpError(
+        "control-flow operation cannot be imported into the temporary egraph");
+
+  if (isa<CallOpInterface>(op))
+    return op->emitOpError(
+        "call-like operation cannot be imported into the temporary egraph");
+
+  if (op->getNumRegions() != 0)
+    return op->emitOpError(
+        "operation with nested regions cannot be imported into the temporary "
+        "egraph");
+
+  if (!isPure(op))
+    return op->emitOpError(
+        "operation is not pure and cannot be imported into the temporary "
+        "egraph");
+
+  for (OpOperand &operand : op->getOpOperands())
+    if (failed(verifyOperandIsBlockLocal(op, operand, block)))
+      return failure();
+
+  return verifyResultUsersAreBlockLocal(op, block);
+}
+
+LogicalResult verifyBlockIsEligibleForImport(Block &block) {
+  if (block.empty())
+    return failure();
+
+  Operation *terminator = block.getTerminator();
+  if (!terminator)
+    return failure();
+
+  LogicalResult result = success();
+  for (Operation &op : block.without_terminator())
+    if (failed(verifyOperationIsEligibleForImport(&op, block)))
+      result = failure();
+
+  for (OpOperand &operand : terminator->getOpOperands())
+    if (failed(verifyOperandIsBlockLocal(terminator, operand, block)))
+      result = failure();
+
+  return result;
+}
+
+FailureOr<OwningOpRef<Operation *>>
+importBlockToMatchGraph(Block &block) {
+  if (failed(verifyBlockIsEligibleForImport(block)))
+    return failure();
+
+  Operation *terminator = block.getTerminator();
+  Operation *anchor = block.getParentOp() ? block.getParentOp() : terminator;
+  if (!anchor)
+    return failure();
+
+  anchor->getContext()->getOrLoadDialect<EGraphDialect>();
+
+  SmallVector<Type, 4> inputTypes;
+  for (BlockArgument argument : block.getArguments())
+    inputTypes.push_back(argument.getType());
+  SmallVector<Type, 4> resultTypes;
+  for (Value value : terminator->getOperands())
+    resultTypes.push_back(value.getType());
+
+  Builder builder(terminator->getContext());
+  FunctionType functionType =
+      builder.getFunctionType(inputTypes, resultTypes);
+  std::string egraphName = "__match_egraph";
+
+  EGraphOp egraph = EGraphOp::create(anchor->getLoc(), egraphName, functionType);
+  OwningOpRef<Operation *> ownedEgraph(egraph.getOperation());
+  EGraphOp ownedEgraphOp = cast<EGraphOp>(ownedEgraph.get());
+
+  Block *entryBlock = ownedEgraphOp.addEntryBlock();
+  OpBuilder bodyBuilder = OpBuilder::atBlockBegin(entryBlock);
+  DeterministicSymbolNamer namer(ownedEgraph.get());
+  DenseMap<Value, FlatSymbolRefAttr> importedSymbols;
+
+  for (auto indexedArg : llvm::enumerate(entryBlock->getArguments())) {
+    unsigned argIndex = indexedArg.index();
+    BlockArgument egraphArg = indexedArg.value();
+    std::string inputName = namer.claim((Twine("arg") + Twine(argIndex)).str());
+    auto nameAttr = bodyBuilder.getStringAttr(inputName);
+    InputOp::create(bodyBuilder, egraphArg.getLoc(), nameAttr, egraphArg,
+                    TypeAttr::get(egraphArg.getType()));
+    importedSymbols.try_emplace(block.getArgument(argIndex),
+                                FlatSymbolRefAttr::get(nameAttr));
+  }
+
+  for (Operation &op : block.without_terminator())
+    if (failed(importOperationToEClass(&op, bodyBuilder, namer,
+                                       importedSymbols)))
+      return failure();
+
+  SmallVector<Attribute> targets;
+  for (Value operand : terminator->getOperands()) {
+    auto symbolIt = importedSymbols.find(operand);
+    if (symbolIt == importedSymbols.end())
+      return terminator->emitOpError("could not resolve terminator operand to "
+                                     "temporary egraph symbol");
+    targets.push_back(symbolIt->second);
+  }
+
+  SmallVector<Type> targetTypes(resultTypes.begin(), resultTypes.end());
+  ReturnOp::create(bodyBuilder, terminator->getLoc(),
+                   bodyBuilder.getArrayAttr(targets),
+                   bodyBuilder.getTypeArrayAttr(targetTypes));
+  return ownedEgraph;
 }
 
 void emitDriverDebug(raw_ostream *stream, StringRef line) {
@@ -227,33 +515,42 @@ LogicalResult tryFoldCandidate(EOpRefBase root,
 }
 } // namespace
 
-StringRef mlir::egraph::stringifyEGraphRewriteDriverLimit(
-    EGraphRewriteDriverLimit limit) {
+StringRef mlir::egraph::stringifyEGraphMatchLimit(EGraphMatchLimit limit) {
   switch (limit) {
-  case EGraphRewriteDriverLimit::None:
+  case EGraphMatchLimit::None:
     return "none";
-  case EGraphRewriteDriverLimit::Iteration:
+  case EGraphMatchLimit::Iteration:
     return "iteration";
-  case EGraphRewriteDriverLimit::Candidate:
+  case EGraphMatchLimit::Candidate:
     return "candidate";
-  case EGraphRewriteDriverLimit::Rebuild:
+  case EGraphMatchLimit::Rebuild:
     return "rebuild";
   }
-  llvm_unreachable("unexpected rewrite driver limit");
+  llvm_unreachable("unexpected match limit");
 }
 
-void mlir::egraph::printEGraphRewriteDriverResult(
-    llvm::raw_ostream &os, const EGraphRewriteDriverResult &result) {
-  os << "limit=" << stringifyEGraphRewriteDriverLimit(result.reachedLimit)
-     << " limit_reached=" << (result.limitReached ? "true" : "false")
-     << " iterations=" << result.iterations
-     << " enqueued_candidates=" << result.enqueuedCandidates
-     << " skipped_stale_refs=" << result.skippedStaleRefs
-     << " matched_patterns=" << result.matchedPatterns
-     << " changed_commits=" << result.changedCommits
-     << " rebuilds=" << result.rebuilds
-     << " changed=" << (result.changed ? "true" : "false");
+void mlir::egraph::printEGraphMatchStats(llvm::raw_ostream &os,
+                                         const EGraphMatchStats &stats) {
+  os << "limit=" << stringifyEGraphMatchLimit(stats.reachedLimit)
+     << " limit_reached=" << (stats.limitReached ? "true" : "false")
+     << " iterations=" << stats.iterations
+     << " enqueued_candidates=" << stats.enqueuedCandidates
+     << " skipped_stale_refs=" << stats.skippedStaleRefs
+     << " matched_patterns=" << stats.matchedPatterns
+     << " changed_commits=" << stats.changedCommits
+     << " rebuilds=" << stats.rebuilds
+     << " changed=" << (stats.changed ? "true" : "false");
 }
+
+GraphMatchState::GraphMatchState(Block &block, std::unique_ptr<EGraph> graph,
+                                 OwningOpRef<Operation *> egraphOp,
+                                 EGraphMatchStats stats)
+    : block(&block), graph(std::move(graph)), egraphOp(std::move(egraphOp)),
+      stats(std::move(stats)) {}
+
+Block &GraphMatchState::getBlock() const { return *block; }
+
+const EGraphMatchStats &GraphMatchState::getStats() const { return stats; }
 
 class EGraphRewriteTransaction::ScratchListener final
     : public OpBuilder::Listener {
@@ -678,19 +975,20 @@ LogicalResult EGraphPatternRewriter::replaceAllUsesWith(Operation *fromOp,
   return transaction->recordEquivalence(*fromRef, toOp);
 }
 
-FailureOr<EGraphRewriteDriverResult> mlir::egraph::applyEGraphPatterns(
-    EGraph &graph, const EGraphPatternSet &patterns, Operation *rebuildRoot,
-    const EGraphRewriteDriverConfig &config) {
+static FailureOr<EGraphMatchStats>
+runEGraphMatchDriver(EGraph &graph, const EGraphPatternSet &patterns,
+                     Operation *rebuildRoot,
+                     const EGraphMatchConfig &config) {
   if (!rebuildRoot)
     return failure();
 
-  EGraphRewriteDriverResult result;
+  EGraphMatchStats result;
   raw_ostream *debugStream = config.debugStream;
 
-  auto returnResult = [&]() -> FailureOr<EGraphRewriteDriverResult> {
+  auto returnResult = [&]() -> FailureOr<EGraphMatchStats> {
     if (debugStream) {
       *debugStream << "driver stats: ";
-      printEGraphRewriteDriverResult(*debugStream, result);
+      printEGraphMatchStats(*debugStream, result);
       *debugStream << '\n';
     }
     return result;
@@ -704,7 +1002,7 @@ FailureOr<EGraphRewriteDriverResult> mlir::egraph::applyEGraphPatterns(
                     "driver debug rebuilt dirty graph before dispatch");
     if (config.maxRebuilds != 0 && result.rebuilds >= config.maxRebuilds) {
       result.limitReached = true;
-      result.reachedLimit = EGraphRewriteDriverLimit::Rebuild;
+      result.reachedLimit = EGraphMatchLimit::Rebuild;
       emitDriverDebug(debugStream,
                       "driver debug reached rebuild limit before dispatch");
       return returnResult();
@@ -713,12 +1011,12 @@ FailureOr<EGraphRewriteDriverResult> mlir::egraph::applyEGraphPatterns(
 
   SmallVector<EOpRefBase, 16> worklist;
 
-  auto recordLimit = [&](EGraphRewriteDriverLimit limit) {
+  auto recordLimit = [&](EGraphMatchLimit limit) {
     result.limitReached = true;
     result.reachedLimit = limit;
     if (debugStream)
       *debugStream << "driver debug reached "
-                   << stringifyEGraphRewriteDriverLimit(limit) << " limit\n";
+                   << stringifyEGraphMatchLimit(limit) << " limit\n";
   };
 
   auto enqueueRefs = [&](ArrayRef<EOpRefBase> refs) {
@@ -727,7 +1025,7 @@ FailureOr<EGraphRewriteDriverResult> mlir::egraph::applyEGraphPatterns(
         continue;
       if (config.maxEnqueuedCandidates != 0 &&
           worklist.size() >= config.maxEnqueuedCandidates) {
-        recordLimit(EGraphRewriteDriverLimit::Candidate);
+        recordLimit(EGraphMatchLimit::Candidate);
         return false;
       }
       worklist.push_back(ref);
@@ -787,7 +1085,7 @@ FailureOr<EGraphRewriteDriverResult> mlir::egraph::applyEGraphPatterns(
     emitDriverDebug(debugStream, "driver debug rebuilt after batched commits");
 
     if (config.maxRebuilds != 0 && result.rebuilds >= config.maxRebuilds) {
-      recordLimit(EGraphRewriteDriverLimit::Rebuild);
+      recordLimit(EGraphMatchLimit::Rebuild);
       return success();
     }
 
@@ -803,7 +1101,7 @@ FailureOr<EGraphRewriteDriverResult> mlir::egraph::applyEGraphPatterns(
        ++worklistIndex) {
     if (config.maxIterations != 0 &&
         result.iterations >= config.maxIterations) {
-      recordLimit(EGraphRewriteDriverLimit::Iteration);
+      recordLimit(EGraphMatchLimit::Iteration);
       break;
     }
 
@@ -879,8 +1177,45 @@ FailureOr<EGraphRewriteDriverResult> mlir::egraph::applyEGraphPatterns(
   return returnResult();
 }
 
-FailureOr<EGraphRewriteDriverResult> mlir::egraph::applyEGraphPatterns(
+FailureOr<EGraphMatchStats> mlir::egraph::applyEGraphPatterns(
+    EGraph &graph, const EGraphPatternSet &patterns, Operation *rebuildRoot,
+    const EGraphMatchConfig &config) {
+  return runEGraphMatchDriver(graph, patterns, rebuildRoot, config);
+}
+
+FailureOr<EGraphMatchStats> mlir::egraph::applyEGraphPatterns(
     EGraph &graph, const EGraphPatternSet &patterns, Operation *rebuildRoot) {
-  EGraphRewriteDriverConfig config;
-  return applyEGraphPatterns(graph, patterns, rebuildRoot, config);
+  EGraphMatchConfig config;
+  return runEGraphMatchDriver(graph, patterns, rebuildRoot, config);
+}
+
+FailureOr<GraphMatchState> mlir::egraph::applyEGraphPatterns(
+    Block &block, const EGraphPatternSet &patterns,
+    const EGraphMatchConfig &config) {
+  FailureOr<OwningOpRef<Operation *>> imported = importBlockToMatchGraph(block);
+  if (failed(imported))
+    return failure();
+
+  auto graph = std::make_unique<EGraph>();
+  EGraphOp egraph = cast<EGraphOp>(imported->get());
+  if (failed(graph->indexEGraph(egraph)))
+    return failure();
+
+  FailureOr<EGraphMatchStats> stats =
+      runEGraphMatchDriver(*graph, patterns, egraph.getOperation(), config);
+  if (failed(stats))
+    return failure();
+
+  return GraphMatchState(block, std::move(graph), std::move(*imported),
+                         std::move(*stats));
+}
+
+LogicalResult mlir::egraph::applyEGraphPatternsAndExtract(
+    Block &block, const EGraphPatternSet &patterns, EGraphExtractMode mode,
+    EGraphExtractCostModel costModel, const EGraphMatchConfig &config) {
+  FailureOr<GraphMatchState> state =
+      applyEGraphPatterns(block, patterns, config);
+  if (failed(state))
+    return failure();
+  return extractEGraph(*state, mode, costModel);
 }

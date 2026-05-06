@@ -1,4 +1,5 @@
 #include "MLIREGraph/EGraph/Extract.h"
+#include "MLIREGraph/EGraph/Pattern.h"
 
 #include "mlir/IR/Block.h"
 #include "mlir/IR/Builders.h"
@@ -16,6 +17,21 @@
 
 using namespace mlir;
 using namespace mlir::egraph;
+
+namespace mlir {
+namespace egraph {
+LogicalResult extractEGraphForTesting(EGraph &graph, EGraphOp egraph,
+                                      EGraphExtractMode mode,
+                                      EGraphExtractCostModel costModel,
+                                      EGraphExtractInfo *info,
+                                      ArrayRef<EValue> explicitRoots);
+FailureOr<SmallVector<Value, 4>>
+materializeEGraphExtractInfoForTesting(EGraph &graph, EGraphOp egraph,
+                                       const EGraphExtractInfo &selection,
+                                       OpBuilder &builder,
+                                       ArrayRef<Value> inputValues);
+} // namespace egraph
+} // namespace mlir
 
 namespace {
 FailureOr<SmallVector<FlatSymbolRefAttr, 4>>
@@ -70,6 +86,11 @@ bool isAliasCandidate(EClassOp eclass, unsigned candidateOrdinal) {
   return succeeded(getAliasCandidateTarget(eclass, candidateOrdinal));
 }
 
+struct EGraphExtractRequest {
+  EGraphExtractMode mode = EGraphExtractMode::Greedy;
+  SmallVector<EValue, 4> roots;
+};
+
 struct GreedyExtractSelection {
   enum class Kind {
     Input,
@@ -110,7 +131,11 @@ selectBestCandidateForRoot(EGraph &graph, EValue root,
   EOpRefBase bestCandidate;
   EGraphExtractCost bestCost = 0;
   for (EOpRefBase candidate : candidates) {
-    FailureOr<EGraphExtractCost> candidateCost = costModel(candidate);
+    Operation *operation = candidate.getOperation();
+    if (!operation)
+      continue;
+
+    FailureOr<EGraphExtractCost> candidateCost = costModel(operation);
     if (failed(candidateCost))
       continue;
 
@@ -132,12 +157,12 @@ public:
                         EGraphExtractCostModel costModel)
       : graph(graph), egraph(egraph), costModel(costModel) {}
 
-  FailureOr<EGraphExtractResult> run(const EGraphExtractRequest &request) {
+  FailureOr<EGraphExtractInfo> run(const EGraphExtractRequest &request) {
     if (!graph.isClean() || !egraph ||
         request.mode != EGraphExtractMode::Greedy)
       return failure();
 
-    EGraphExtractResult result;
+    EGraphExtractInfo result;
     result.mode = EGraphExtractMode::Greedy;
     result.roots = request.roots;
     result.rootCosts.reserve(request.roots.size());
@@ -350,7 +375,11 @@ private:
 
   FailureOr<GreedyExtractSelection>
   computeCandidateSelection(EOpRefBase candidate) {
-    FailureOr<EGraphExtractCost> localCost = costModel(candidate);
+    Operation *operation = candidate.getOperation();
+    if (!operation)
+      return failure();
+
+    FailureOr<EGraphExtractCost> localCost = costModel(operation);
     if (failed(localCost))
       return failure();
 
@@ -384,7 +413,7 @@ private:
     return selection;
   }
 
-  LogicalResult collectSelected(EValue root, EGraphExtractResult &result,
+  LogicalResult collectSelected(EValue root, EGraphExtractInfo &result,
                                 bool preserveSymbol = false) {
     FailureOr<GreedyExtractSelection> selection =
         preserveSymbol ? computeBestPreservingSymbol(root) : computeBest(root);
@@ -470,7 +499,7 @@ struct ExtractMaterializationChoice {
 class ExtractMaterializer {
 public:
   ExtractMaterializer(EGraph &graph, EGraphOp egraph,
-                      const EGraphExtractResult &selection, OpBuilder &builder,
+                      const EGraphExtractInfo &selection, OpBuilder &builder,
                       ArrayRef<Value> inputValues)
       : graph(graph), egraph(egraph), selection(selection), builder(builder),
         inputValues(inputValues) {}
@@ -670,7 +699,7 @@ private:
 
   EGraph &graph;
   EGraphOp egraph;
-  const EGraphExtractResult &selection;
+  const EGraphExtractInfo &selection;
   OpBuilder &builder;
   ArrayRef<Value> inputValues;
   DenseMap<StringAttr, ExtractMaterializationChoice> selectionMap;
@@ -681,7 +710,7 @@ private:
 
 FailureOr<SmallVector<Value, 4>>
 materializeExtractSelection(EGraph &graph, EGraphOp egraph,
-                            const EGraphExtractResult &selection,
+                            const EGraphExtractInfo &selection,
                             OpBuilder &builder, ArrayRef<Value> inputValues) {
   ExtractMaterializer materializer(graph, egraph, selection, builder,
                                    inputValues);
@@ -716,7 +745,7 @@ public:
                                    EGraphExtractCostModel costModel)
       : graph(graph), egraph(egraph), costModel(costModel) {}
 
-  FailureOr<EGraphExtractResult> run(const EGraphExtractRequest &request) {
+  FailureOr<EGraphExtractInfo> run(const EGraphExtractRequest &request) {
     if (!graph.isClean() || !egraph ||
         request.mode != EGraphExtractMode::LinearProgramming)
       return failure();
@@ -737,7 +766,7 @@ public:
     if (failed(solve()))
       return failure();
 
-    EGraphExtractResult result;
+    EGraphExtractInfo result;
     result.mode = EGraphExtractMode::LinearProgramming;
     result.roots = request.roots;
     result.rootCosts.reserve(request.roots.size());
@@ -841,7 +870,11 @@ private:
         if (failed(candidateRoot))
           continue;
 
-        FailureOr<EGraphExtractCost> localCost = costModel(*candidateRoot);
+        Operation *operation = candidateRoot->getOperation();
+        if (!operation)
+          continue;
+
+        FailureOr<EGraphExtractCost> localCost = costModel(operation);
         if (failed(localCost))
           continue;
 
@@ -1041,7 +1074,7 @@ private:
   }
 
   FailureOr<EGraphExtractCost>
-  collectSelected(StringAttr symbol, EGraphExtractResult &result,
+  collectSelected(StringAttr symbol, EGraphExtractInfo &result,
                   DenseMap<StringAttr, EGraphExtractCost> &subtreeCosts,
                   SmallVectorImpl<StringAttr> &collectingSymbols) {
     auto costIt = subtreeCosts.find(symbol);
@@ -1192,10 +1225,10 @@ StringRef mlir::egraph::stringifyEGraphExtractMode(EGraphExtractMode mode) {
   llvm_unreachable("unexpected egraph extract mode");
 }
 
-FailureOr<EGraphExtractRequest>
-mlir::egraph::buildEGraphExtractRequest(EGraph &graph, EGraphOp egraph,
-                                        ArrayRef<EValue> explicitRoots,
-                                        EGraphExtractMode mode) {
+static FailureOr<EGraphExtractRequest>
+buildExtractRequest(EGraph &graph, EGraphOp egraph,
+                    ArrayRef<EValue> explicitRoots,
+                    EGraphExtractMode mode) {
   if (!egraph || egraph.isExternal() || egraph.getBody().empty())
     return failure();
 
@@ -1224,50 +1257,18 @@ mlir::egraph::buildEGraphExtractRequest(EGraph &graph, EGraphOp egraph,
   return buildRequestFromRoots(graph, egraph, returnRoots, mode);
 }
 
-FailureOr<EGraphExtractResult>
-mlir::egraph::selectEGraphExtractCandidates(EGraph &graph,
-                                            const EGraphExtractRequest &request,
-                                            EGraphExtractCostModel costModel) {
-  if (!graph.isClean())
-    return failure();
-
-  EGraphExtractResult result;
-  result.mode = request.mode;
-  result.roots = request.roots;
-  result.rootCosts.reserve(request.roots.size());
-  result.selectedEClasses.reserve(request.roots.size());
-  result.selectedCandidateRoots.reserve(request.roots.size());
-  result.selectedCandidateCosts.reserve(request.roots.size());
-  result.selectedSubtreeCosts.reserve(request.roots.size());
-
-  for (EValue root : request.roots) {
-    FailureOr<std::pair<EOpRefBase, EGraphExtractCost>> bestCandidate =
-        selectBestCandidateForRoot(graph, root, costModel);
-    if (failed(bestCandidate))
-      return failure();
-
-    result.selectedEClasses.push_back(root);
-    result.selectedCandidateRoots.push_back(bestCandidate->first);
-    result.selectedCandidateCosts.push_back(bestCandidate->second);
-    result.selectedSubtreeCosts.push_back(bestCandidate->second);
-    result.rootCosts.push_back(bestCandidate->second);
-  }
-
-  result.changed = !result.selectedCandidateRoots.empty();
-  return result;
-}
-
-FailureOr<EGraphExtractResult>
-mlir::egraph::extractEGraphGreedily(EGraph &graph, EGraphOp egraph,
-                                    const EGraphExtractRequest &request,
-                                    EGraphExtractCostModel costModel) {
+static FailureOr<EGraphExtractInfo>
+runGreedyExtract(EGraph &graph, EGraphOp egraph,
+                 const EGraphExtractRequest &request,
+                 EGraphExtractCostModel costModel) {
   GreedyEGraphExtractor extractor(graph, egraph, costModel);
   return extractor.run(request);
 }
 
-FailureOr<EGraphExtractResult> mlir::egraph::extractEGraphByLinearProgramming(
-    EGraph &graph, EGraphOp egraph, const EGraphExtractRequest &request,
-    EGraphExtractCostModel costModel) {
+static FailureOr<EGraphExtractInfo>
+runLinearProgrammingExtract(EGraph &graph, EGraphOp egraph,
+                            const EGraphExtractRequest &request,
+                            EGraphExtractCostModel costModel) {
 #ifdef MLIR_EGRAPH_ENABLE_Z3
   LinearProgrammingEGraphExtractor extractor(graph, egraph, costModel);
   return extractor.run(request);
@@ -1280,9 +1281,111 @@ FailureOr<EGraphExtractResult> mlir::egraph::extractEGraphByLinearProgramming(
 #endif
 }
 
-FailureOr<SmallVector<Value, 4>> mlir::egraph::materializeEGraphExtractResult(
-    EGraph &graph, EGraphOp egraph, const EGraphExtractResult &selection,
+LogicalResult mlir::egraph::extractEGraphForTesting(
+    EGraph &graph, EGraphOp egraph, EGraphExtractMode mode,
+    EGraphExtractCostModel costModel, EGraphExtractInfo *info,
+    ArrayRef<EValue> explicitRoots) {
+  FailureOr<EGraphExtractRequest> request =
+      buildExtractRequest(graph, egraph, explicitRoots, mode);
+  if (failed(request))
+    return failure();
+
+  FailureOr<EGraphExtractInfo> selection;
+  switch (mode) {
+  case EGraphExtractMode::Greedy:
+    selection = runGreedyExtract(graph, egraph, *request, costModel);
+    break;
+  case EGraphExtractMode::LinearProgramming:
+    selection = runLinearProgrammingExtract(graph, egraph, *request, costModel);
+    break;
+  }
+  if (failed(selection))
+    return failure();
+
+  if (info)
+    *info = *selection;
+  return success();
+}
+
+FailureOr<SmallVector<Value, 4>>
+mlir::egraph::materializeEGraphExtractInfoForTesting(
+    EGraph &graph, EGraphOp egraph, const EGraphExtractInfo &selection,
     OpBuilder &builder, ArrayRef<Value> inputValues) {
   return materializeExtractSelection(graph, egraph, selection, builder,
                                      inputValues);
+}
+
+LogicalResult mlir::egraph::extractEGraph(GraphMatchState &state,
+                                          EGraphExtractMode mode,
+                                          EGraphExtractCostModel costModel,
+                                          ArrayRef<EValue> explicitRoots,
+                                          EGraphExtractInfo *info) {
+  if (state.extracted || !state.block || !state.graph || !state.egraphOp)
+    return failure();
+
+  Block &block = state.getBlock();
+  Operation *terminator = block.getTerminator();
+  if (!terminator)
+    return failure();
+
+  EGraphOp egraph = cast<EGraphOp>(state.egraphOp.get());
+  FailureOr<EGraphExtractRequest> request =
+      buildExtractRequest(*state.graph, egraph, explicitRoots, mode);
+  if (failed(request))
+    return failure();
+
+  FailureOr<EGraphExtractInfo> selection;
+  switch (mode) {
+  case EGraphExtractMode::Greedy:
+    selection = runGreedyExtract(*state.graph, egraph, *request, costModel);
+    break;
+  case EGraphExtractMode::LinearProgramming:
+    selection = runLinearProgrammingExtract(*state.graph, egraph, *request,
+                                            costModel);
+    break;
+  }
+  if (failed(selection))
+    return failure();
+
+  if (info)
+    *info = *selection;
+
+  SmallVector<Operation *, 4> oldOps;
+  oldOps.reserve(block.getOperations().size());
+  for (Operation &op : block.without_terminator())
+    oldOps.push_back(&op);
+
+  Operation *oldTail = oldOps.empty() ? nullptr : oldOps.back();
+  OpBuilder builder(terminator->getContext());
+  builder.setInsertionPoint(terminator);
+
+  SmallVector<Value, 4> inputValues(block.getArguments().begin(),
+                                    block.getArguments().end());
+  FailureOr<SmallVector<Value, 4>> roots =
+      materializeExtractSelection(*state.graph, egraph, *selection, builder,
+                                 inputValues);
+  if (failed(roots)) {
+    for (Operation *op = terminator->getPrevNode(); op && op != oldTail;) {
+      Operation *previous = op->getPrevNode();
+      op->erase();
+      op = previous;
+    }
+    return failure();
+  }
+
+  if (roots->size() != terminator->getNumOperands()) {
+    for (Operation *op = terminator->getPrevNode(); op && op != oldTail;) {
+      Operation *previous = op->getPrevNode();
+      op->erase();
+      op = previous;
+    }
+    return failure();
+  }
+
+  terminator->setOperands(*roots);
+  for (Operation *op : llvm::reverse(oldOps))
+    op->erase();
+
+  state.extracted = true;
+  return success();
 }
