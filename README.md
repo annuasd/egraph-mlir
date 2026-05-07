@@ -26,13 +26,7 @@ cmake -S . -B build \
 
 ## Quick Start
 
-Import a `func.func` into an e-graph:
-
-```sh
-build/bin/mlir-egraph-opt test/Smoke/func-to-egraph.mlir --convert-func-to-egraph
-```
-
-Run the standalone demo:
+Run the standalone block-level rewrite and extract demo:
 
 ```sh
 build/bin/mlir-egraph-demo

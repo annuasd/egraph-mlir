@@ -131,7 +131,7 @@ mlir::LogicalResult runDemo(mlir::ModuleOp module) {
   patterns.add<MulByOneToAliasPattern>();
 
   if (mlir::failed(mlir::egraph::applyEGraphPatternsAndExtract(
-          originalBlock, patterns, mlir::egraph::EGraphExtractMode::Greedy,
+          originalBlock, patterns, mlir::egraph::EGraphExtractMode::LinearProgramming,
           getDemoExtractCost)))
     return module.emitError("failed to optimize @arith_demo");
 

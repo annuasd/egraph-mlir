@@ -1,10 +1,8 @@
-#include "MLIREGraph/EGraph/FuncToEGraph.h"
 #include "MLIREGraph/IR/EGraphDialect.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/Pass/Pass.h"
-#include "mlir/Pass/PassManager.h"
 #include "mlir/Pass/PassRegistry.h"
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
 
@@ -19,9 +17,6 @@ void registerEGraphTestPasses();
 
 #ifndef MLIR_EGRAPH_TEST_LIBRARY
 int main(int argc, char **argv) {
-  mlir::registerPass(
-      []() { return mlir::egraph::createConvertFuncToEGraphPass(); });
-
 #ifdef MLIR_EGRAPH_ENABLE_TEST_DIALECT
   // Keep test-only pass registration behind the dedicated build flag.
   registerEGraphTestPasses();

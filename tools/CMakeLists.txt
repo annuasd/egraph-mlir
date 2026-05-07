@@ -3,7 +3,6 @@ set(LLVM_LINK_COMPONENTS
 )
 
 set(LIBS
-  EGraphConversion
   EGraphIR
   MLIRArithDialect
   MLIRFuncDialect
