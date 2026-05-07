@@ -1,6 +1,7 @@
 #include "MLIREGraph/IR/EGraphDialect.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassRegistry.h"
@@ -26,6 +27,7 @@ int main(int argc, char **argv) {
   registry.insert<mlir::arith::ArithDialect>();
   registry.insert<mlir::egraph::EGraphDialect>();
   registry.insert<mlir::func::FuncDialect>();
+  registry.insert<mlir::scf::SCFDialect>();
 #ifdef MLIR_EGRAPH_ENABLE_TEST_DIALECT
   registry.insert<mlir::cf::ControlFlowDialect>();
   registry.insert<mlir::egraph::test::EGraphTestDialect>();

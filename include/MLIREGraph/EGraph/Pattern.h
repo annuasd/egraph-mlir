@@ -294,14 +294,27 @@ private:
   llvm::StringMap<SmallVector<EGraphPattern *>> patternsByRoot;
 };
 
+/// Applies egraph patterns to exactly one block.
 FailureOr<GraphMatchState>
 applyEGraphPatterns(Block &block, const EGraphPatternSet &patterns,
                     const EGraphMatchConfig &config = {});
+/// Applies egraph patterns to blocks owned by an operation. By default only
+/// direct region blocks are processed. Recursive mode skips container blocks
+/// with nested-region ops and processes nested flat blocks instead.
+FailureOr<EGraphMatchStats>
+applyEGraphPatterns(Operation *op, const EGraphPatternSet &patterns,
+                    const EGraphMatchConfig &config = {},
+                    bool recurseIntoNestedBlocks = false);
 
+/// Applies egraph patterns to exactly one block and extracts the result.
 LogicalResult applyEGraphPatternsAndExtract(
     Block &block, const EGraphPatternSet &patterns, EGraphExtractMode mode,
-    EGraphExtractCostModel costModel,
-    const EGraphMatchConfig &config = {});
+    EGraphExtractCostModel costModel, const EGraphMatchConfig &config = {});
+/// Applies egraph patterns to operation-owned blocks and extracts each result.
+LogicalResult applyEGraphPatternsAndExtract(
+    Operation *op, const EGraphPatternSet &patterns, EGraphExtractMode mode,
+    EGraphExtractCostModel costModel, const EGraphMatchConfig &config = {},
+    bool recurseIntoNestedBlocks = false);
 
 /// Formats a match limit for diagnostics.
 StringRef stringifyEGraphMatchLimit(EGraphMatchLimit limit);

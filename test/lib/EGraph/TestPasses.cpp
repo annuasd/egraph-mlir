@@ -4,6 +4,7 @@
 #include "MLIREGraph/IR/EGraphDialect.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassRegistry.h"
@@ -2876,19 +2877,20 @@ mlir::LogicalResult runMatchAndExtractPipeline(mlir::ModuleOp module) {
   patterns.add<DemoDivSelfToOnePattern>(divSelfMatches);
   patterns.add<DemoMulByOneToAliasPattern>(mulByOneMatches);
 
-  mlir::Block &block = demoFunc.getBody().front();
+  mlir::Operation *demoOp = demoFunc.getOperation();
   if (mlir::failed(mlir::egraph::applyEGraphPatternsAndExtract(
-          block, patterns, mlir::egraph::EGraphExtractMode::Greedy,
-          getDemoExtractCost)))
+          demoOp, patterns, mlir::egraph::EGraphExtractMode::Greedy,
+          getDemoExtractCost, {}, /*recurseIntoNestedBlocks=*/false)))
     return module.emitError("egraph match/extract pipeline failed");
 
-  if (mulByTwoMatches == 0 || reassociateMatches == 0 ||
-      divSelfMatches == 0 || mulByOneMatches == 0)
+  if (mulByTwoMatches == 0 || reassociateMatches == 0 || divSelfMatches == 0 ||
+      mulByOneMatches == 0)
     return module.emitError(
         "egraph match/extract did not exercise all demo patterns");
 
-  auto returnOp = llvm::dyn_cast_or_null<mlir::func::ReturnOp>(
-      block.getTerminator());
+  mlir::Block &block = demoFunc.getBody().front();
+  auto returnOp =
+      llvm::dyn_cast_or_null<mlir::func::ReturnOp>(block.getTerminator());
   if (!returnOp || returnOp.getNumOperands() != 1 ||
       returnOp.getOperand(0) != block.getArgument(0))
     return module.emitError(
@@ -2898,6 +2900,38 @@ mlir::LogicalResult runMatchAndExtractPipeline(mlir::ModuleOp module) {
         "egraph match/extract left redundant operations in the demo block");
 
   module.emitRemark() << "egraph pipeline matched and extracted arith demo";
+  return mlir::success();
+}
+
+mlir::LogicalResult runRecursiveMatchAndExtractPipeline(mlir::ModuleOp module) {
+  auto demoFunc = module.lookupSymbol<mlir::func::FuncOp>("nested_demo");
+  if (!demoFunc)
+    return module.emitError("expected a demo func.func named @nested_demo");
+
+  unsigned mulByTwoMatches = 0;
+  unsigned reassociateMatches = 0;
+  unsigned divSelfMatches = 0;
+  unsigned mulByOneMatches = 0;
+  mlir::egraph::EGraphPatternSet patterns;
+  patterns.add<DemoMulByTwoToShiftPattern>(mulByTwoMatches);
+  patterns.add<DemoReassociateDivPattern>(reassociateMatches);
+  patterns.add<DemoDivSelfToOnePattern>(divSelfMatches);
+  patterns.add<DemoMulByOneToAliasPattern>(mulByOneMatches);
+
+  mlir::Operation *demoOp = demoFunc.getOperation();
+  mlir::egraph::EGraphMatchConfig config;
+  if (mlir::failed(mlir::egraph::applyEGraphPatternsAndExtract(
+          demoOp, patterns, mlir::egraph::EGraphExtractMode::Greedy,
+          getDemoExtractCost, config, /*recurseIntoNestedBlocks=*/true)))
+    return module.emitError("recursive egraph match/extract pipeline failed");
+
+  if (mulByTwoMatches == 0 || reassociateMatches == 0 || divSelfMatches == 0 ||
+      mulByOneMatches == 0)
+    return module.emitError(
+        "recursive egraph match/extract did not exercise all demo patterns");
+
+  module.emitRemark()
+      << "egraph recursive pipeline matched and extracted nested arith demo";
   return mlir::success();
 }
 
@@ -2923,6 +2957,33 @@ struct TestEGraphMatchAndExtractPipelinePass
 
   void runOnOperation() final {
     if (mlir::failed(runMatchAndExtractPipeline(getOperation())))
+      signalPassFailure();
+  }
+};
+
+struct TestEGraphMatchAndExtractRecursivePipelinePass
+    : public mlir::PassWrapper<TestEGraphMatchAndExtractRecursivePipelinePass,
+                               mlir::OperationPass<mlir::ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
+      TestEGraphMatchAndExtractRecursivePipelinePass)
+
+  llvm::StringRef getArgument() const final {
+    return "test-egraph-match-and-extract-recursive";
+  }
+
+  llvm::StringRef getDescription() const final {
+    return "test recursive MLIR-EGraph match and extract pipeline";
+  }
+
+  void getDependentDialects(mlir::DialectRegistry &registry) const final {
+    registry.insert<mlir::arith::ArithDialect>();
+    registry.insert<mlir::egraph::EGraphDialect>();
+    registry.insert<mlir::func::FuncDialect>();
+    registry.insert<mlir::scf::SCFDialect>();
+  }
+
+  void runOnOperation() final {
+    if (mlir::failed(runRecursiveMatchAndExtractPipeline(getOperation())))
       signalPassFailure();
   }
 };
@@ -3390,6 +3451,7 @@ struct TestEGraphWorklistDriverPass
 
 void registerEGraphTestPasses() {
   mlir::PassRegistration<TestEGraphMatchAndExtractPipelinePass>();
+  mlir::PassRegistration<TestEGraphMatchAndExtractRecursivePipelinePass>();
   mlir::PassRegistration<TestEGraphExtractInfoPass>();
   mlir::PassRegistration<TestEGraphExtractCostModelPass>();
   mlir::PassRegistration<TestEGraphGreedyExtractPass>();

@@ -389,6 +389,48 @@ void emitDriverDebugCandidate(raw_ostream *stream, EGraph &graph,
   *stream << '\n';
 }
 
+bool blockContainsNestedRegionOps(Block &block) {
+  return llvm::any_of(block,
+                      [](Operation &op) { return op.getNumRegions() != 0; });
+}
+
+void accumulateMatchStats(EGraphMatchStats &accumulator,
+                          const EGraphMatchStats &stats) {
+  accumulator.changed |= stats.changed;
+  accumulator.limitReached |= stats.limitReached;
+  accumulator.iterations += stats.iterations;
+  accumulator.enqueuedCandidates += stats.enqueuedCandidates;
+  accumulator.skippedStaleRefs += stats.skippedStaleRefs;
+  accumulator.matchedPatterns += stats.matchedPatterns;
+  accumulator.changedCommits += stats.changedCommits;
+  accumulator.rebuilds += stats.rebuilds;
+  if (accumulator.reachedLimit == EGraphMatchLimit::None &&
+      stats.reachedLimit != EGraphMatchLimit::None)
+    accumulator.reachedLimit = stats.reachedLimit;
+}
+
+template <typename CallbackT>
+LogicalResult runBlockMatches(Operation *op, bool recurseIntoNestedBlocks,
+                              CallbackT &&callback) {
+  if (!recurseIntoNestedBlocks) {
+    for (Region &region : op->getRegions())
+      for (Block &block : region)
+        if (failed(callback(block)))
+          return failure();
+    return success();
+  }
+
+  bool failedAny = false;
+  op->walk([&](Block *block) {
+    if (blockContainsNestedRegionOps(*block))
+      return WalkResult::advance();
+    if (failed(callback(*block)))
+      failedAny = true;
+    return failedAny ? WalkResult::interrupt() : WalkResult::advance();
+  });
+  return failure(failedAny);
+}
+
 void emitTransactionAddDebug(raw_ostream &os,
                              const EGraphInternedOperation &interned) {
   os << "commit add: ";
@@ -1210,6 +1252,26 @@ FailureOr<GraphMatchState> mlir::egraph::applyEGraphPatterns(
                          std::move(*stats));
 }
 
+FailureOr<EGraphMatchStats> mlir::egraph::applyEGraphPatterns(
+    Operation *op, const EGraphPatternSet &patterns,
+    const EGraphMatchConfig &config, bool recurseIntoNestedBlocks) {
+  assert(op && "operation must not be null");
+
+  EGraphMatchStats aggregatedStats;
+  LogicalResult result = runBlockMatches(
+      op, recurseIntoNestedBlocks, [&](Block &block) -> LogicalResult {
+        FailureOr<GraphMatchState> state =
+            applyEGraphPatterns(block, patterns, config);
+        if (failed(state))
+          return failure();
+        accumulateMatchStats(aggregatedStats, state->getStats());
+        return success();
+      });
+  if (failed(result))
+    return failure();
+  return aggregatedStats;
+}
+
 LogicalResult mlir::egraph::applyEGraphPatternsAndExtract(
     Block &block, const EGraphPatternSet &patterns, EGraphExtractMode mode,
     EGraphExtractCostModel costModel, const EGraphMatchConfig &config) {
@@ -1218,4 +1280,20 @@ LogicalResult mlir::egraph::applyEGraphPatternsAndExtract(
   if (failed(state))
     return failure();
   return extractEGraph(*state, mode, costModel);
+}
+
+LogicalResult mlir::egraph::applyEGraphPatternsAndExtract(
+    Operation *op, const EGraphPatternSet &patterns, EGraphExtractMode mode,
+    EGraphExtractCostModel costModel, const EGraphMatchConfig &config,
+    bool recurseIntoNestedBlocks) {
+  assert(op && "operation must not be null");
+
+  LogicalResult result = runBlockMatches(
+      op, recurseIntoNestedBlocks, [&](Block &block) -> LogicalResult {
+        return applyEGraphPatternsAndExtract(block, patterns, mode, costModel,
+                                             config);
+      });
+  if (failed(result))
+    return failure();
+  return success();
 }

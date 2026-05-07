@@ -6,6 +6,7 @@ set(LIBS
   EGraphIR
   MLIRArithDialect
   MLIRFuncDialect
+  MLIRSCFDialect
   MLIROptLib
   MLIRPass
 )
