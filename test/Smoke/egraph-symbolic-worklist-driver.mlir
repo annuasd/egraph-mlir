@@ -46,13 +46,12 @@ module {
 // CHECK-DAG: remark: worklist driver matched nested op_a
 // CHECK-DAG: remark: worklist driver processed enqueued new candidate root
 // CHECK-DAG: remark: worklist driver reached iteration limit
-// CHECK-DAG: remark: worklist driver reached candidate limit
-// CHECK-DAG: remark: worklist driver reached rebuild limit
+// CHECK-DAG: remark: worklist driver skipped per-eclass candidate cap
+// CHECK-DAG: remark: worklist driver added MLIR fold alternative
 // CHECK-DAG: remark: worklist driver rebuilt dirty graph before matching
 // CHECK-DAG: remark: worklist driver added equivalent candidate
 // CHECK-DAG: remark: worklist driver discarded failed pattern
 // CHECK-DAG: remark: worklist driver skipped rebuild for no-op success
 // CHECK-DAG: remark: worklist driver rebuilt after batched commits
 // CHECK-DAG: remark: worklist driver stats counted matched patterns
-// CHECK-DAG: remark: worklist driver stats: limit=none limit_reached=false iterations={{[0-9]+}} enqueued_candidates={{[0-9]+}} skipped_stale_refs={{[0-9]+}} matched_patterns={{[0-9]+}} changed_commits=1 rebuilds=2 changed=true
-// CHECK-DAG: remark: driver debug enqueued: candidate {{.*}} in symbol @{{[A-Za-z0-9_]+}} with leader symbols {{.*}} and structural key {{.*}}
+// CHECK-DAG: remark: worklist driver stats: limit=none limit_reached=false iterations={{[0-9]+}} enqueued_candidates={{[0-9]+}} skipped_candidate_cap=0 skipped_stale_refs={{[0-9]+}} matched_patterns={{[0-9]+}} changed_commits=1 rebuilds=2 changed=true

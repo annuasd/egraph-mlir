@@ -1,4 +1,3 @@
-// Minimal input for mlir-egraph-demo.
 module {
   func.func @arith_demo(%x: i32) -> i32 {
     %c2 = arith.constant 2 : i32

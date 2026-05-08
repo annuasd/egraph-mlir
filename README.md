@@ -12,7 +12,7 @@ cmake -S . -B build \
   -DLLVM_DIR=/path/to/llvm/lib/cmake/llvm \
   -DMLIR_DIR=/path/to/llvm/lib/cmake/mlir \
   -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
-cmake --build build --target mlir-egraph-opt mlir-egraph-demo
+cmake --build build --target mlir-egraph-opt arith-demo transpose-demo
 ```
 
 Enable the Z3-backed extractor when a Z3 CMake package is available:
@@ -26,10 +26,11 @@ cmake -S . -B build \
 
 ## Quick Start
 
-Run the standalone block-level rewrite and extract demo:
+Run the standalone block-level rewrite and extract demos:
 
 ```sh
-build/bin/mlir-egraph-demo
+build/bin/arith-demo
+build/bin/transpose-demo
 ```
 
 ## License

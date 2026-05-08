@@ -49,7 +49,7 @@ module {
 // REMARK-DAG: remark: worklist driver skipped rebuild for no-op success
 // REMARK-DAG: remark: worklist driver rebuilt after batched commits
 // REMARK-DAG: remark: worklist driver processed enqueued new candidate root
-// REMARK-DAG: remark: worklist driver stats: limit=none limit_reached=false iterations={{[0-9]+}} enqueued_candidates={{[0-9]+}} skipped_stale_refs={{[0-9]+}} matched_patterns={{[0-9]+}} changed_commits=1 rebuilds=2 changed=true
+// REMARK-DAG: remark: worklist driver stats: limit=none limit_reached=false iterations={{[0-9]+}} enqueued_candidates={{[0-9]+}} skipped_candidate_cap=0 skipped_stale_refs={{[0-9]+}} matched_patterns={{[0-9]+}} changed_commits=1 rebuilds=2 changed=true
 
 // IR-LABEL: module {
 // IR: egraph.egraph @symbolic_worklist_driver(%[[X:arg[0-9]+]]: i32, %[[Y:arg[0-9]+]]: i32, %[[Z:arg[0-9]+]]: i32) -> i32 {

@@ -67,19 +67,15 @@ struct EGraphRewriteCommitResult {
 enum class EGraphMatchLimit {
   None,
   Iteration,
-  Candidate,
-  Rebuild,
 };
 
-/// Match limits and tracing knobs. Zero-valued limits mean unlimited.
+/// Match driver knobs. Zero-valued limits mean unlimited.
 struct EGraphMatchConfig {
   unsigned maxIterations = 0;
-  unsigned maxEnqueuedCandidates = 0;
-  unsigned maxRebuilds = 0;
-  /// Attempt MLIR fold on each dispatched candidate before user rewrites.
+  unsigned maxCandidatesPerEClass = 0;
+  /// Treat MLIR fold results as egraph rewrite alternatives, not in-place IR
+  /// canonicalization.
   bool enableMlirFold = false;
-  /// Optional debug stream for driver tracing.
-  llvm::raw_ostream *debugStream = nullptr;
 };
 
 /// Summary of a match run.
@@ -89,6 +85,7 @@ struct EGraphMatchStats {
   EGraphMatchLimit reachedLimit = EGraphMatchLimit::None;
   unsigned iterations = 0;
   unsigned enqueuedCandidates = 0;
+  unsigned skippedCandidateCap = 0;
   unsigned skippedStaleRefs = 0;
   unsigned matchedPatterns = 0;
   unsigned changedCommits = 0;

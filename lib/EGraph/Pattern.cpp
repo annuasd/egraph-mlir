@@ -359,34 +359,34 @@ importBlockToMatchGraph(Block &block) {
   return ownedEgraph;
 }
 
-void emitDriverDebug(raw_ostream *stream, StringRef line) {
-  if (!stream)
-    return;
-  *stream << line << '\n';
+void emitDriverDebug(StringRef line) {
+  LDBG_OS([&](raw_ostream &os) { os << line << '\n'; });
 }
 
-void emitDriverDebugCandidate(raw_ostream *stream, EGraph &graph,
-                              StringRef prefix, EOpRefBase ref) {
-  if (!stream || !ref || !ref.isLive())
+void emitDriverDebugCandidate(EGraph &graph, StringRef prefix, EOpRefBase ref) {
+  if (!ref || !ref.isLive())
     return;
 
-  *stream << prefix << ": candidate " << ref.getOperationName()
-          << " in symbol @" << ref.getEClassOp().getSymName()
-          << " with leader symbols ";
-  SmallVector<StringAttr, 4> leaderSymbols;
-  for (unsigned resultSlot : ref.getYieldedResultSlots()) {
-    EValue leader = ref.getResult(resultSlot).getLeader();
-    if (leader.getSymbolNameAttr())
-      leaderSymbols.push_back(leader.getSymbolNameAttr());
-  }
-  printDriverDebugSymbols(*stream, leaderSymbols);
+  auto emit = [&](raw_ostream &os) {
+    os << prefix << ": candidate " << ref.getOperationName()
+       << " in symbol @" << ref.getEClassOp().getSymName()
+       << " with leader symbols ";
+    SmallVector<StringAttr, 4> leaderSymbols;
+    for (unsigned resultSlot : ref.getYieldedResultSlots()) {
+      EValue leader = ref.getResult(resultSlot).getLeader();
+      if (leader.getSymbolNameAttr())
+        leaderSymbols.push_back(leader.getSymbolNameAttr());
+    }
+    printDriverDebugSymbols(os, leaderSymbols);
 
-  FailureOr<EGraphStructuralKey> key = graph.getStructuralKey(ref);
-  if (succeeded(key)) {
-    *stream << " and structural key ";
-    printDriverStructuralKey(*stream, *key);
-  }
-  *stream << '\n';
+    FailureOr<EGraphStructuralKey> key = graph.getStructuralKey(ref);
+    if (succeeded(key)) {
+      os << " and structural key ";
+      printDriverStructuralKey(os, *key);
+    }
+    os << '\n';
+  };
+  LDBG_OS(emit);
 }
 
 bool blockContainsNestedRegionOps(Block &block) {
@@ -400,6 +400,7 @@ void accumulateMatchStats(EGraphMatchStats &accumulator,
   accumulator.limitReached |= stats.limitReached;
   accumulator.iterations += stats.iterations;
   accumulator.enqueuedCandidates += stats.enqueuedCandidates;
+  accumulator.skippedCandidateCap += stats.skippedCandidateCap;
   accumulator.skippedStaleRefs += stats.skippedStaleRefs;
   accumulator.matchedPatterns += stats.matchedPatterns;
   accumulator.changedCommits += stats.changedCommits;
@@ -563,10 +564,6 @@ StringRef mlir::egraph::stringifyEGraphMatchLimit(EGraphMatchLimit limit) {
     return "none";
   case EGraphMatchLimit::Iteration:
     return "iteration";
-  case EGraphMatchLimit::Candidate:
-    return "candidate";
-  case EGraphMatchLimit::Rebuild:
-    return "rebuild";
   }
   llvm_unreachable("unexpected match limit");
 }
@@ -577,6 +574,7 @@ void mlir::egraph::printEGraphMatchStats(llvm::raw_ostream &os,
      << " limit_reached=" << (stats.limitReached ? "true" : "false")
      << " iterations=" << stats.iterations
      << " enqueued_candidates=" << stats.enqueuedCandidates
+     << " skipped_candidate_cap=" << stats.skippedCandidateCap
      << " skipped_stale_refs=" << stats.skippedStaleRefs
      << " matched_patterns=" << stats.matchedPatterns
      << " changed_commits=" << stats.changedCommits
@@ -1025,14 +1023,13 @@ runEGraphMatchDriver(EGraph &graph, const EGraphPatternSet &patterns,
     return failure();
 
   EGraphMatchStats result;
-  raw_ostream *debugStream = config.debugStream;
 
   auto returnResult = [&]() -> FailureOr<EGraphMatchStats> {
-    if (debugStream) {
-      *debugStream << "driver stats: ";
-      printEGraphMatchStats(*debugStream, result);
-      *debugStream << '\n';
-    }
+    LDBG_OS([&](raw_ostream &os) {
+      os << "driver stats: ";
+      printEGraphMatchStats(os, result);
+      os << '\n';
+    });
     return result;
   };
 
@@ -1040,46 +1037,53 @@ runEGraphMatchDriver(EGraph &graph, const EGraphPatternSet &patterns,
     if (failed(graph.rebuild(rebuildRoot)))
       return failure();
     ++result.rebuilds;
-    emitDriverDebug(debugStream,
-                    "driver debug rebuilt dirty graph before dispatch");
-    if (config.maxRebuilds != 0 && result.rebuilds >= config.maxRebuilds) {
-      result.limitReached = true;
-      result.reachedLimit = EGraphMatchLimit::Rebuild;
-      emitDriverDebug(debugStream,
-                      "driver debug reached rebuild limit before dispatch");
-      return returnResult();
-    }
+    emitDriverDebug("driver debug rebuilt dirty graph before dispatch");
   }
 
   SmallVector<EOpRefBase, 16> worklist;
+  DenseMap<StringAttr, unsigned> enqueuedByEClass;
 
   auto recordLimit = [&](EGraphMatchLimit limit) {
     result.limitReached = true;
     result.reachedLimit = limit;
-    if (debugStream)
-      *debugStream << "driver debug reached "
-                   << stringifyEGraphMatchLimit(limit) << " limit\n";
+    LDBG_OS([&](raw_ostream &os) {
+      os << "driver debug reached " << stringifyEGraphMatchLimit(limit)
+         << " limit\n";
+    });
+  };
+
+  auto getLeaderEClassSymbol = [&](EOpRefBase ref) -> StringAttr {
+    if (!ref || !ref.isLive())
+      return StringAttr();
+    return graph.getValue(ref.getEClassOp().getSymNameAttr())
+        .getLeader()
+        .getSymbolNameAttr();
   };
 
   auto enqueueRefs = [&](ArrayRef<EOpRefBase> refs) {
     for (EOpRefBase ref : refs) {
       if (!ref || containsWorklistRef(worklist, ref))
         continue;
-      if (config.maxEnqueuedCandidates != 0 &&
-          worklist.size() >= config.maxEnqueuedCandidates) {
-        recordLimit(EGraphMatchLimit::Candidate);
-        return false;
+
+      StringAttr eclassSymbol = getLeaderEClassSymbol(ref);
+      if (config.maxCandidatesPerEClass != 0 && eclassSymbol) {
+        unsigned &enqueuedForEClass = enqueuedByEClass[eclassSymbol];
+        if (enqueuedForEClass >= config.maxCandidatesPerEClass) {
+          ++result.skippedCandidateCap;
+          emitDriverDebugCandidate(
+              graph, "driver debug skipped per-eclass candidate cap", ref);
+          continue;
+        }
+        ++enqueuedForEClass;
       }
+
       worklist.push_back(ref);
-      result.enqueuedCandidates = worklist.size();
-      emitDriverDebugCandidate(debugStream, graph, "driver debug enqueued",
-                               ref);
+      ++result.enqueuedCandidates;
+      emitDriverDebugCandidate(graph, "driver debug enqueued", ref);
     }
-    return true;
   };
 
-  if (!enqueueRefs(graph.getOpRefs()))
-    return returnResult();
+  enqueueRefs(graph.getOpRefs());
 
   // Match all refs in the current round against a clean snapshot. Applying the
   // transactions is deferred to the round boundary so same-round matches do not
@@ -1102,8 +1106,7 @@ runEGraphMatchDriver(EGraph &graph, const EGraphPatternSet &patterns,
       if (failed(committed))
         return failure();
       if (!committed->changed) {
-        emitDriverDebugCandidate(debugStream, graph,
-                                 "driver debug kept no-op success for",
+        emitDriverDebugCandidate(graph, "driver debug kept no-op success for",
                                  pending.root);
         continue;
       }
@@ -1111,7 +1114,7 @@ runEGraphMatchDriver(EGraph &graph, const EGraphPatternSet &patterns,
       result.changed = true;
       changedInRound = true;
       ++result.changedCommits;
-      emitDriverDebugCandidate(debugStream, graph,
+      emitDriverDebugCandidate(graph,
                                "driver debug committed changed rewrite for",
                                pending.root);
     }
@@ -1124,16 +1127,10 @@ runEGraphMatchDriver(EGraph &graph, const EGraphPatternSet &patterns,
     if (failed(rebuilt))
       return failure();
     ++result.rebuilds;
-    emitDriverDebug(debugStream, "driver debug rebuilt after batched commits");
+    emitDriverDebug("driver debug rebuilt after batched commits");
 
-    if (config.maxRebuilds != 0 && result.rebuilds >= config.maxRebuilds) {
-      recordLimit(EGraphMatchLimit::Rebuild);
-      return success();
-    }
-
-    if (!enqueueRefs(rebuilt->newCandidateRoots) ||
-        !enqueueRefs(rebuilt->affectedParentCandidates))
-      return success();
+    enqueueRefs(rebuilt->newCandidateRoots);
+    enqueueRefs(rebuilt->affectedParentCandidates);
 
     return success();
   };
@@ -1152,7 +1149,7 @@ runEGraphMatchDriver(EGraph &graph, const EGraphPatternSet &patterns,
 
     if (!root.isLive()) {
       ++result.skippedStaleRefs;
-      emitDriverDebug(debugStream, "driver debug skipped stale candidate ref");
+      emitDriverDebug("driver debug skipped stale candidate ref");
       continue;
     }
 
@@ -1187,16 +1184,15 @@ runEGraphMatchDriver(EGraph &graph, const EGraphPatternSet &patterns,
         EGraphPatternRewriter rewriter(*transaction);
         if (failed(pattern->matchAndRewrite(root, rewriter))) {
           transaction->discard();
-          emitDriverDebugCandidate(debugStream, graph,
-                                   "driver debug discarded failed pattern for",
-                                   root);
+          emitDriverDebugCandidate(
+              graph, "driver debug discarded failed pattern for", root);
           continue;
         }
 
         ++result.matchedPatterns;
         if (!transaction->hasEvents()) {
           transaction->discard();
-          emitDriverDebugCandidate(debugStream, graph,
+          emitDriverDebugCandidate(graph,
                                    "driver debug kept no-op success for", root);
           continue;
         }

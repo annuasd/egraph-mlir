@@ -119,14 +119,6 @@ void emitDriverStatsRemark(
   anchor->emitRemark() << "worklist driver stats: " << buffer;
 }
 
-void emitDriverDebugTraceRemarks(mlir::Operation *anchor,
-                                 llvm::StringRef trace) {
-  llvm::SmallVector<llvm::StringRef> lines;
-  trace.split(lines, '\n', -1, false);
-  for (llvm::StringRef line : lines)
-    anchor->emitRemark() << line;
-}
-
 std::string formatExtractRoots(llvm::ArrayRef<mlir::egraph::EValue> roots) {
   std::string buffer;
   llvm::raw_string_ostream os(buffer);
@@ -818,15 +810,6 @@ verifyGreedyExtractMaterialization(mlir::ModuleOp module,
   mlir::func::ReturnOp::create(builder, egraph->getLoc(), *roots);
   module.emitRemark() << "egraph extract materialized @" << egraph->getSymName()
                       << " into @" << materializedFunc.getSymName();
-  return mlir::success();
-}
-
-mlir::LogicalResult verifyDriverDebugTrace(mlir::Operation *anchor,
-                                           llvm::StringRef trace) {
-  if (!trace.contains("candidate") || !trace.contains("symbol") ||
-      !trace.contains("leader") || !trace.contains("structural key"))
-    return anchor->emitOpError(
-        "worklist driver debug trace missed required terminology");
   return mlir::success();
 }
 
@@ -2393,6 +2376,30 @@ private:
   bool &sawAddedCandidate;
 };
 
+struct WorklistRhsRewritePattern final
+    : public mlir::egraph::EGraphPatternFor<mlir::egraph::test::OpBOp> {
+  explicit WorklistRhsRewritePattern(bool &rewroteRhs)
+      : rewroteRhs(rewroteRhs) {}
+
+  mlir::LogicalResult
+  matchAndRewrite(mlir::egraph::EOpRef<mlir::egraph::test::OpBOp> root,
+                  mlir::egraph::EGraphPatternRewriter &rewriter) const final {
+    auto tagAttr = root.getOp()->getAttrOfType<mlir::StringAttr>("tag");
+    if (!tagAttr || tagAttr.getValue() != "driver_rhs")
+      return mlir::failure();
+
+    auto replacement = mlir::egraph::test::OpBOp::create(
+        rewriter, root.getLoc(), root.getOperation()->getResult(0).getType(),
+        root.getOperation()->getOperand(0),
+        rewriter.getStringAttr("driver_added"));
+    rewroteRhs = true;
+    return rewriter.replaceOp(root, replacement->getResults());
+  }
+
+private:
+  bool &rewroteRhs;
+};
+
 mlir::LogicalResult verifyWorklistDriverIterationLimit(
     mlir::ModuleOp module, const mlir::egraph::EGraphPatternSet &patterns) {
   mlir::OwningOpRef<mlir::Operation *> clonedModuleRef(module->clone());
@@ -2422,6 +2429,7 @@ mlir::LogicalResult verifyWorklistDriverIterationLimit(
   if (driven->rebuilds != 0)
     return module.emitError("limited worklist driver rebuilt unexpectedly");
   if (driven->enqueuedCandidates != initialRefCount ||
+      driven->skippedCandidateCap != 0 ||
       graph.getOpRefs().size() != initialRefCount ||
       countEClasses(clonedModule) != initialEClassCount)
     return module.emitError("limited worklist driver changed persistent state");
@@ -2430,79 +2438,90 @@ mlir::LogicalResult verifyWorklistDriverIterationLimit(
   return mlir::success();
 }
 
-mlir::LogicalResult verifyWorklistDriverCandidateLimit(
-    mlir::ModuleOp module, const mlir::egraph::EGraphPatternSet &patterns) {
+mlir::LogicalResult verifyWorklistDriverCandidateCap(mlir::ModuleOp module) {
   mlir::OwningOpRef<mlir::Operation *> clonedModuleRef(module->clone());
   auto clonedModule = mlir::cast<mlir::ModuleOp>(clonedModuleRef.get());
 
   mlir::egraph::EGraph graph;
   if (mlir::failed(indexTestGraph(clonedModule, graph)))
-    return module.emitError("failed to index cloned candidate-limit graph");
+    return module.emitError("failed to index cloned candidate-cap graph");
 
-  unsigned initialRefCount = graph.getOpRefs().size();
-  if (initialRefCount < 2)
-    return module.emitError("expected at least two initial candidate roots");
-  unsigned initialEClassCount = countEClasses(clonedModule);
+  bool rewroteRhs = false;
+  bool sawAddedCandidate = false;
+  mlir::egraph::EGraphPatternSet patterns;
+  patterns.add<WorklistRhsRewritePattern>(rewroteRhs);
+  patterns.add<WorklistAddedCandidatePattern>(sawAddedCandidate);
 
   mlir::egraph::EGraphMatchConfig config;
-  config.maxEnqueuedCandidates = initialRefCount - 1;
+  config.maxCandidatesPerEClass = 1;
 
   mlir::FailureOr<mlir::egraph::EGraphMatchStats> driven =
       mlir::egraph::applyEGraphPatterns(graph, patterns, clonedModule, config);
   if (mlir::failed(driven))
-    return module.emitError("candidate-limited worklist driver failed");
-  if (!driven->limitReached ||
-      driven->reachedLimit != mlir::egraph::EGraphMatchLimit::Candidate)
-    return module.emitError("worklist driver did not report candidate limit");
-  if (driven->iterations != 0)
+    return module.emitError("candidate-capped worklist driver failed");
+  if (driven->limitReached ||
+      driven->reachedLimit != mlir::egraph::EGraphMatchLimit::None)
+    return module.emitError("candidate cap unexpectedly stopped the driver");
+  if (!driven->changed || driven->changedCommits != 1 || driven->rebuilds != 1)
+    return module.emitError("candidate cap changed rewrite commit behavior");
+  if (driven->skippedCandidateCap == 0)
     return module.emitError(
-        "candidate-limited worklist driver iterated unexpectedly");
-  if (driven->enqueuedCandidates != initialRefCount - 1)
+        "worklist driver did not skip any per-eclass candidates");
+  if (!rewroteRhs)
+    return module.emitError("candidate-capped worklist driver missed rewrite");
+  if (sawAddedCandidate)
     return module.emitError(
-        "candidate-limited worklist driver used unexpected enqueue count");
-  if (driven->changed || driven->changedCommits != 0 || driven->rebuilds != 0)
+        "candidate-capped worklist driver processed a capped candidate");
+  if (mlir::failed(findOpBByTag(graph, "driver_added")))
     return module.emitError(
-        "candidate-limited worklist driver changed persistent state");
-  if (graph.getOpRefs().size() != initialRefCount ||
-      countEClasses(clonedModule) != initialEClassCount)
-    return module.emitError(
-        "candidate-limited worklist driver changed persistent state");
+        "candidate-capped worklist driver did not create the capped candidate");
 
-  module.emitRemark() << "worklist driver reached candidate limit";
+  module.emitRemark() << "worklist driver skipped per-eclass candidate cap";
   return mlir::success();
 }
 
-mlir::LogicalResult
-verifySymbolicWorklistDriverRebuildLimit(mlir::ModuleOp module) {
+mlir::LogicalResult verifyWorklistDriverMlirFold(mlir::ModuleOp module) {
   mlir::OwningOpRef<mlir::Operation *> clonedModuleRef(module->clone());
   auto clonedModule = mlir::cast<mlir::ModuleOp>(clonedModuleRef.get());
 
   mlir::egraph::EGraph graph;
   if (mlir::failed(indexTestGraph(clonedModule, graph)))
-    return module.emitError("failed to index cloned rebuild-limit graph");
-  if (mlir::failed(seedDirtyWorklistGraph(clonedModule, graph)))
-    return mlir::failure();
+    return module.emitError("failed to index cloned MLIR-fold graph");
 
   mlir::egraph::EGraphPatternSet patterns;
   mlir::egraph::EGraphMatchConfig config;
-  config.maxRebuilds = 1;
+  config.enableMlirFold = true;
 
   mlir::FailureOr<mlir::egraph::EGraphMatchStats> driven =
       mlir::egraph::applyEGraphPatterns(graph, patterns, clonedModule, config);
   if (mlir::failed(driven))
-    return module.emitError("rebuild-limited worklist driver failed");
-  if (!driven->limitReached ||
-      driven->reachedLimit != mlir::egraph::EGraphMatchLimit::Rebuild)
-    return module.emitError("worklist driver did not report rebuild limit");
-  if (!graph.isClean())
-    return module.emitError(
-        "rebuild-limited worklist driver left a dirty graph");
-  if (driven->iterations != 0 || driven->matchedPatterns != 0 ||
-      driven->changed || driven->changedCommits != 0 || driven->rebuilds != 1)
-    return module.emitError(
-        "rebuild-limited worklist driver used unexpected stats");
+    return module.emitError("MLIR-fold worklist driver failed");
+  if (driven->limitReached ||
+      driven->reachedLimit != mlir::egraph::EGraphMatchLimit::None)
+    return module.emitError("MLIR-fold worklist driver unexpectedly stopped");
+  if (!driven->changed || driven->changedCommits == 0)
+    return module.emitError("MLIR-fold worklist driver did not add a rewrite");
+  if (driven->matchedPatterns != 0)
+    return module.emitError("MLIR fold was counted as a user pattern");
 
-  module.emitRemark() << "worklist driver reached rebuild limit";
+  mlir::FailureOr<mlir::egraph::EOpRefBase> foldedRoot =
+      findOpBByTag(graph, "driver_rhs");
+  if (mlir::failed(foldedRoot))
+    return module.emitError("expected tagged op_b candidate after MLIR fold");
+
+  bool sawTaggedDef = false;
+  bool sawTaglessDef = false;
+  for (mlir::egraph::EOpRef<mlir::egraph::test::OpBOp> def :
+       foldedRoot->getResult(0).getDefs<mlir::egraph::test::OpBOp>()) {
+    auto tagAttr = def.getOp()->getAttrOfType<mlir::StringAttr>("tag");
+    sawTaggedDef |= tagAttr && tagAttr.getValue() == "driver_rhs";
+    sawTaglessDef |= !tagAttr;
+  }
+  if (!sawTaggedDef || !sawTaglessDef)
+    return module.emitError(
+        "MLIR fold did not keep tagged and tagless egraph alternatives");
+
+  module.emitRemark() << "worklist driver added MLIR fold alternative";
   return mlir::success();
 }
 
@@ -2518,20 +2537,13 @@ mlir::LogicalResult verifyWorklistDriver(mlir::ModuleOp module,
   patterns.add<WorklistNestedRewritePattern>(matchedNested);
   patterns.add<WorklistAddedCandidatePattern>(sawAddedCandidate);
 
-  if (mlir::failed(verifyWorklistDriverIterationLimit(module, patterns)) ||
-      mlir::failed(verifyWorklistDriverCandidateLimit(module, patterns)))
+  if (mlir::failed(verifyWorklistDriverIterationLimit(module, patterns)))
     return mlir::failure();
 
-  std::string debugTraceStorage;
-  llvm::raw_string_ostream debugTrace(debugTraceStorage);
-  mlir::egraph::EGraphMatchConfig config;
-  config.debugStream = &debugTrace;
-
   mlir::FailureOr<mlir::egraph::EGraphMatchStats> driven =
-      mlir::egraph::applyEGraphPatterns(graph, patterns, module, config);
+      mlir::egraph::applyEGraphPatterns(graph, patterns, module);
   if (mlir::failed(driven))
     return module.emitError("worklist driver failed");
-  debugTrace.flush();
   if (driven->limitReached ||
       driven->reachedLimit != mlir::egraph::EGraphMatchLimit::None)
     return module.emitError("worklist driver unexpectedly hit a limit");
@@ -2568,11 +2580,8 @@ mlir::LogicalResult verifyWorklistDriver(mlir::ModuleOp module,
   if (!sawAddedDef)
     return module.emitError(
         "worklist driver did not expose the added equivalent candidate");
-  if (mlir::failed(verifyDriverDebugTrace(module, debugTraceStorage)))
-    return mlir::failure();
 
   emitDriverStatsRemark(module, *driven);
-  emitDriverDebugTraceRemarks(module, debugTraceStorage);
   module.emitRemark() << "worklist driver added equivalent candidate";
   module.emitRemark() << "worklist driver discarded failed pattern";
   module.emitRemark() << "worklist driver skipped rebuild for no-op success";
@@ -2604,20 +2613,14 @@ mlir::LogicalResult verifySymbolicWorklistDriver(mlir::ModuleOp module,
   patterns.add<WorklistAddedCandidatePattern>(sawAddedCandidate);
 
   if (mlir::failed(verifyWorklistDriverIterationLimit(module, patterns)) ||
-      mlir::failed(verifyWorklistDriverCandidateLimit(module, patterns)) ||
-      mlir::failed(verifySymbolicWorklistDriverRebuildLimit(module)))
+      mlir::failed(verifyWorklistDriverCandidateCap(module)) ||
+      mlir::failed(verifyWorklistDriverMlirFold(module)))
     return mlir::failure();
 
-  std::string debugTraceStorage;
-  llvm::raw_string_ostream debugTrace(debugTraceStorage);
-  mlir::egraph::EGraphMatchConfig config;
-  config.debugStream = &debugTrace;
-
   mlir::FailureOr<mlir::egraph::EGraphMatchStats> driven =
-      mlir::egraph::applyEGraphPatterns(graph, patterns, module, config);
+      mlir::egraph::applyEGraphPatterns(graph, patterns, module);
   if (mlir::failed(driven))
     return module.emitError("symbolic worklist driver failed");
-  debugTrace.flush();
   if (!graph.isClean())
     return module.emitError("symbolic worklist driver left a dirty graph");
   if (driven->limitReached ||
@@ -2664,11 +2667,8 @@ mlir::LogicalResult verifySymbolicWorklistDriver(mlir::ModuleOp module,
     return module.emitError(
         "symbolic worklist driver did not expose the added equivalent "
         "candidate");
-  if (mlir::failed(verifyDriverDebugTrace(module, debugTraceStorage)))
-    return mlir::failure();
 
   emitDriverStatsRemark(module, *driven);
-  emitDriverDebugTraceRemarks(module, debugTraceStorage);
   module.emitRemark() << "worklist driver rebuilt dirty graph before matching";
   module.emitRemark() << "worklist driver added equivalent candidate";
   module.emitRemark() << "worklist driver discarded failed pattern";

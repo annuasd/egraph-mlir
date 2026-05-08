@@ -11,15 +11,14 @@
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/raw_ostream.h"
 
-#ifndef MLIR_EGRAPH_DEMO_INPUT
-#define MLIR_EGRAPH_DEMO_INPUT "demo/demo.mlir"
+#ifndef ARITH_DEMO_INPUT
+#define ARITH_DEMO_INPUT "demo/arith/arith.mlir"
 #endif
 
 namespace {
 
 bool hasConstantIntegerDef(mlir::egraph::EValue value, int64_t expected) {
-  for (auto def :
-       value.getDefs<mlir::arith::ConstantOp>()) {
+  for (auto def : value.getDefs<mlir::arith::ConstantOp>()) {
     auto integer = llvm::dyn_cast<mlir::IntegerAttr>(def.getOp().getValue());
     if (integer && integer.getInt() == expected)
       return true;
@@ -131,7 +130,8 @@ mlir::LogicalResult runDemo(mlir::ModuleOp module) {
   patterns.add<MulByOneToAliasPattern>();
 
   if (mlir::failed(mlir::egraph::applyEGraphPatternsAndExtract(
-          originalBlock, patterns, mlir::egraph::EGraphExtractMode::LinearProgramming,
+          originalBlock, patterns,
+          mlir::egraph::EGraphExtractMode::LinearProgramming,
           getDemoExtractCost)))
     return module.emitError("failed to optimize @arith_demo");
 
@@ -148,8 +148,8 @@ int main(int argc, char **argv) {
 
   llvm::cl::opt<std::string> inputFilename(
       llvm::cl::Positional, llvm::cl::desc("<input mlir>"),
-      llvm::cl::init(MLIR_EGRAPH_DEMO_INPUT));
-  llvm::cl::ParseCommandLineOptions(argc, argv, "MLIR-EGraph API demo\n");
+      llvm::cl::init(ARITH_DEMO_INPUT));
+  llvm::cl::ParseCommandLineOptions(argc, argv, "MLIR-EGraph arith demo\n");
 
   mlir::DialectRegistry registry;
   registry.insert<mlir::arith::ArithDialect, mlir::egraph::EGraphDialect,
