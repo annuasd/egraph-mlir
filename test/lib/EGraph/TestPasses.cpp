@@ -5,6 +5,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/OperationSupport.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassRegistry.h"
@@ -1211,6 +1212,30 @@ getSingleCandidateRef(mlir::egraph::EClassOp eclass,
   return symbolRef.getAttr();
 }
 
+mlir::LogicalResult verifyNoDuplicateCandidates(mlir::egraph::EClassOp eclass) {
+  mlir::ArrayAttr candidateRefs = eclass.getCandidateRefs();
+  for (auto lhsIndexed : llvm::enumerate(eclass.getCandidates())) {
+    unsigned lhsOrdinal = lhsIndexed.index();
+    mlir::Region &lhsRegion = lhsIndexed.value();
+    for (auto rhsIndexed : llvm::enumerate(
+             llvm::drop_begin(eclass.getCandidates(), lhsOrdinal + 1))) {
+      unsigned rhsOrdinal = lhsOrdinal + 1 + rhsIndexed.index();
+      mlir::Region &rhsRegion = rhsIndexed.value();
+      if (candidateRefs[lhsOrdinal] != candidateRefs[rhsOrdinal])
+        continue;
+      if (!llvm::hasSingleElement(lhsRegion) ||
+          !llvm::hasSingleElement(rhsRegion))
+        continue;
+      if (mlir::OperationEquivalence::isRegionEquivalentTo(
+              &lhsRegion, &rhsRegion,
+              mlir::OperationEquivalence::IgnoreLocations |
+                  mlir::OperationEquivalence::IgnoreCommutativity))
+        return eclass.emitOpError("contains duplicate symbolic candidates");
+    }
+  }
+  return mlir::success();
+}
+
 mlir::FailureOr<mlir::egraph::EOpRefBase>
 getUniqueLiveRootForEClass(mlir::egraph::EGraph &graph,
                            mlir::egraph::EClassOp eclass) {
@@ -1402,31 +1427,28 @@ mlir::LogicalResult verifySymbolicFixedPoint(mlir::ModuleOp module) {
         "symbolic rebuild did not reach grandparent fixed point");
   grandLhs.emitRemark() << "symbolic rebuild reached grandparent fixed point";
 
-  mlir::FailureOr<mlir::StringAttr> parentChildRef =
-      getSingleCandidateRef(parentLhs, 1);
-  mlir::FailureOr<mlir::StringAttr> grandChildRef =
-      getSingleCandidateRef(grandLhs, 1);
-  if (mlir::failed(parentChildRef) || *parentChildRef != lhs.getSymNameAttr() ||
-      mlir::failed(grandChildRef) ||
-      *grandChildRef != parentLhs.getSymNameAttr())
-    return parentLhs.emitOpError(
-        "symbolic rebuild did not rewrite child refs to leader symbols");
-  parentLhs.emitRemark()
-      << "symbolic rebuild rewrote child refs to leader symbols";
-
   if (returnOp.getTargets().size() != 1 ||
       mlir::cast<mlir::FlatSymbolRefAttr>(returnOp.getTargets()[0]).getAttr() !=
           grandLhs.getSymNameAttr())
     return returnOp.emitOpError(
         "symbolic fixed-point rebuild did not retarget return");
 
-  if (parentLhs.getCandidates().size() < 2 ||
-      grandLhs.getCandidates().size() < 2)
+  if (parentLhs.getCandidates().size() != 1)
+    return parentLhs.emitOpError(
+        "symbolic fixed-point rebuild did not deduplicate parent candidates");
+  if (grandLhs.getCandidates().size() != 1)
     return grandLhs.emitOpError(
-        "symbolic fixed-point rebuild did not physically absorb transitive "
-        "members");
+        "symbolic fixed-point rebuild did not deduplicate grandparent candidates");
   grandLhs.emitRemark()
-      << "symbolic rebuild removed transitive member eclasses";
+      << "symbolic rebuild deduplicated transitive member candidates";
+
+  for (mlir::Operation &op : egraph.getBody().front()) {
+    auto candidateEClass = mlir::dyn_cast<mlir::egraph::EClassOp>(op);
+    if (!candidateEClass)
+      continue;
+    if (mlir::failed(verifyNoDuplicateCandidates(candidateEClass)))
+      return mlir::failure();
+  }
 
   mlir::FailureOr<mlir::egraph::EOpRefBase> probeRef =
       getUniqueLiveRootForEClass(graph, probe);

@@ -85,24 +85,21 @@ module {
 
 // CHECK-DAG: remark: symbolic rebuild merged parent eclasses after child union
 // CHECK-DAG: remark: symbolic rebuild reached grandparent fixed point
-// CHECK-DAG: remark: symbolic rebuild rewrote child refs to leader symbols
 // CHECK-DAG: remark: symbolic structural key hashed rebuilt probe by leader symbols
-// CHECK-DAG: remark: symbolic rebuild removed transitive member eclasses
+// CHECK-DAG: remark: symbolic rebuild deduplicated transitive member candidates
 // CHECK-DAG: remark: symbolic self and mutual cycles survived rebuild
 // CHECK: egraph.egraph @symbolic_fixed_point(%arg0: i32) -> i32 {
 // CHECK: input @x = %arg0 : i32
 // CHECK-NOT: eclass @rhs : i32 {
 // CHECK: eclass @parent_lhs : i32 {
+// CHECK-NOT: candidate args(@lhs) (%[[PARENT_RHS_ARG:arg[0-9]+]]: i32) {
 // CHECK: candidate args(@lhs) (%[[PARENT_LHS_ARG:arg[0-9]+]]: i32) {
 // CHECK: egraph_test.op_b %[[PARENT_LHS_ARG]] : (i32) -> i32
-// CHECK: candidate args(@lhs) (%[[PARENT_RHS_ARG:arg[0-9]+]]: i32) {
-// CHECK: egraph_test.op_b %[[PARENT_RHS_ARG]] : (i32) -> i32
 // CHECK-NOT: eclass @parent_rhs : i32 {
 // CHECK: eclass @grand_lhs : i32 {
+// CHECK-NOT: candidate args(@parent_lhs) (%[[GRAND_RHS_ARG:arg[0-9]+]]: i32) {
 // CHECK: candidate args(@parent_lhs) (%[[GRAND_LHS_ARG:arg[0-9]+]]: i32) {
 // CHECK: egraph_test.op_b %[[GRAND_LHS_ARG]] : (i32) -> i32
-// CHECK: candidate args(@parent_lhs) (%[[GRAND_RHS_ARG:arg[0-9]+]]: i32) {
-// CHECK: egraph_test.op_b %[[GRAND_RHS_ARG]] : (i32) -> i32
 // CHECK-NOT: eclass @grand_rhs : i32 {
 // CHECK: eclass @probe : i32 {
 // CHECK: candidate args(@lhs, @x) (%arg{{[0-9]+}}: i32, %arg{{[0-9]+}}: i32) {

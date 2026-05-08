@@ -4,6 +4,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/IR/OperationSupport.h"
 #include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
@@ -54,6 +55,19 @@ std::string getOperationStem(OperationName operationName) {
   if (dot != StringRef::npos)
     name = name.drop_front(dot + 1);
   return sanitizeSymbolStem(name);
+}
+
+bool isDuplicateCandidate(Region &lhs, Region &rhs,
+                          ArrayRef<Attribute> lhsRefs,
+                          ArrayRef<Attribute> rhsRefs) {
+  if (lhsRefs != rhsRefs)
+    return false;
+  if (!llvm::hasSingleElement(lhs) || !llvm::hasSingleElement(rhs))
+    return false;
+  return OperationEquivalence::isRegionEquivalentTo(
+      &lhs, &rhs,
+      OperationEquivalence::IgnoreLocations |
+          OperationEquivalence::IgnoreCommutativity);
 }
 
 LogicalResult
@@ -1094,24 +1108,71 @@ EGraph::recreateSymbolicEClass(EClassOp eclass, ArrayAttr candidateRefs,
     return failure();
 
   OpBuilder builder(eclass.getContext());
-  SmallVector<Attribute> rebuiltCandidateRefs(candidateRefs.begin(),
-                                              candidateRefs.end());
-  unsigned absorbedCandidateCount = 0;
+  StringAttr eclassName = eclass.getSymNameAttr();
+  struct CandidateCloneSpec {
+    ArrayAttr refs;
+    Region *candidate = nullptr;
+  };
+  SmallVector<CandidateCloneSpec, 8> uniqueCandidates;
+  SmallVector<Attribute> rebuiltCandidateRefs;
+  rebuiltCandidateRefs.reserve(candidateRefs.size());
+
+  auto addUniqueCandidatesFrom =
+      [&](ArrayRef<Attribute> refs, MutableArrayRef<Region> candidates)
+      -> LogicalResult {
+    if (refs.size() < candidates.size())
+      return failure();
+
+    for (auto indexedRegion : llvm::enumerate(candidates)) {
+      unsigned candidateOrdinal = indexedRegion.index();
+      Region &candidate = indexedRegion.value();
+      ArrayAttr candidateRefRow = cast<ArrayAttr>(refs[candidateOrdinal]);
+      bool duplicate = false;
+      for (const CandidateCloneSpec &existing : uniqueCandidates) {
+        if (isDuplicateCandidate(*existing.candidate, candidate,
+                                 existing.refs.getValue(),
+                                 candidateRefRow.getValue())) {
+          duplicate = true;
+          break;
+        }
+      }
+      if (duplicate)
+        continue;
+
+      rebuiltCandidateRefs.push_back(candidateRefRow);
+      uniqueCandidates.push_back({candidateRefRow, &candidate});
+    }
+    return success();
+  };
+
+  unsigned preservedCandidateCount =
+      preserveExistingCandidates ? eclass.getCandidates().size() : 0;
+  if (candidateRefs.size() != preservedCandidateCount + extraCandidateCount)
+    return failure();
+
+  if (preserveExistingCandidates) {
+    if (failed(addUniqueCandidatesFrom(candidateRefs.getValue(),
+                                       eclass.getCandidates())))
+      return failure();
+  }
+
   for (EClassOp absorbedMember : absorbedMembers) {
     if (!absorbedMember)
       return failure();
     ArrayAttr memberRefs = absorbedMember.getCandidateRefs();
-    rebuiltCandidateRefs.append(memberRefs.begin(), memberRefs.end());
-    absorbedCandidateCount += absorbedMember.getCandidates().size();
+    if (failed(addUniqueCandidatesFrom(memberRefs.getValue(),
+                                       absorbedMember.getCandidates())))
+      return failure();
   }
 
-  StringAttr eclassName = eclass.getSymNameAttr();
-  unsigned preservedCandidateCount =
-      preserveExistingCandidates ? eclass.getCandidates().size() : 0;
+  for (Attribute extraRef :
+       llvm::drop_begin(candidateRefs.getValue(), preservedCandidateCount))
+    rebuiltCandidateRefs.push_back(extraRef);
+
   auto newEClass = EClassOp::create(
       builder, eclass.getLoc(), eclass.getSymNameAttr(),
       eclass.getPayloadTypeAttr(), builder.getArrayAttr(rebuiltCandidateRefs),
-      preservedCandidateCount + absorbedCandidateCount + extraCandidateCount);
+      uniqueCandidates.size() + extraCandidateCount);
   Operation *newOp = newEClass.getOperation();
 
   for (NamedAttribute attr : eclass->getAttrs()) {
@@ -1138,13 +1199,8 @@ EGraph::recreateSymbolicEClass(EClassOp eclass, ArrayAttr candidateRefs,
     ++newCandidateIt;
   };
 
-  if (preserveExistingCandidates) {
-    for (Region &candidate : eclass.getCandidates())
-      cloneCandidate(candidate);
-  }
-  for (EClassOp absorbedMember : absorbedMembers)
-    for (Region &candidate : absorbedMember.getCandidates())
-      cloneCandidate(candidate);
+  for (const CandidateCloneSpec &spec : uniqueCandidates)
+    cloneCandidate(*spec.candidate);
 
   eclass->getBlock()->getOperations().insert(eclass->getIterator(), newOp);
   payloadSymbols[eclassName] = newOp;

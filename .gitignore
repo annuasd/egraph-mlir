@@ -49,6 +49,7 @@ autoconf/aclocal.m4
 autoconf/autom4te.cache
 /compile_commands.json
 /tablegen_compile_commands.yml
+/demo.mlir
 # Visual Studio built-in CMake configuration
 /CMakeSettings.json
 # CLion project configuration

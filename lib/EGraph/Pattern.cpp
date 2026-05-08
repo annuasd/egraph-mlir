@@ -15,6 +15,7 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Support/DebugLog.h"
 #include "llvm/Support/ErrorHandling.h"
 #include <cassert>
@@ -1275,6 +1276,13 @@ LogicalResult mlir::egraph::applyEGraphPatternsAndExtract(
       applyEGraphPatterns(block, patterns, config);
   if (failed(state))
     return failure();
+
+  LLVM_DEBUG({
+    llvm::dbgs() << "Saturated egraph before extract:\n";
+    state->egraphOp.get()->print(llvm::dbgs());
+    llvm::dbgs() << '\n';
+  });
+
   return extractEGraph(*state, mode, costModel);
 }
 
