@@ -16,15 +16,18 @@ cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
 
 # Run tests.
 cmake --build build --target check-mlir-egraph
+
+# Build examples.
+cmake --build build --target mlir-egraph-example
 ```
 
 ## Quick Start
 
-Run the standalone block-level rewrite and extract demos:
+Run the standalone block-level rewrite and extract examples:
 
 ```sh
-build/bin/arith-demo
-build/bin/transpose-demo
+build/bin/arith-example
+build/bin/transpose-example
 ```
 
 ## License

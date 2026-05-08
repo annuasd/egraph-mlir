@@ -11,8 +11,8 @@
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/raw_ostream.h"
 
-#ifndef ARITH_DEMO_INPUT
-#define ARITH_DEMO_INPUT "demo/arith/arith.mlir"
+#ifndef ARITH_EXAMPLE_INPUT
+#define ARITH_EXAMPLE_INPUT "example/arith/arith.mlir"
 #endif
 
 namespace {
@@ -27,7 +27,7 @@ bool hasConstantIntegerDef(mlir::egraph::EValue value, int64_t expected) {
 }
 
 mlir::FailureOr<mlir::egraph::EGraphExtractCost>
-getDemoExtractCost(mlir::Operation *op) {
+getExampleExtractCost(mlir::Operation *op) {
   if (llvm::isa<mlir::arith::ConstantOp>(op))
     return mlir::egraph::EGraphExtractCost(1);
   if (llvm::isa<mlir::arith::ShLIOp>(op))
@@ -117,10 +117,10 @@ struct MulByOneToAliasPattern final
   }
 };
 
-mlir::LogicalResult runDemo(mlir::ModuleOp module) {
-  auto originalFunc = module.lookupSymbol<mlir::func::FuncOp>("arith_demo");
+mlir::LogicalResult runExample(mlir::ModuleOp module) {
+  auto originalFunc = module.lookupSymbol<mlir::func::FuncOp>("arith_example");
   if (!originalFunc)
-    return module.emitError("expected a func.func named @arith_demo");
+    return module.emitError("expected a func.func named @arith_example");
   mlir::Block &originalBlock = originalFunc.getBody().front();
 
   mlir::egraph::EGraphPatternSet patterns;
@@ -132,8 +132,8 @@ mlir::LogicalResult runDemo(mlir::ModuleOp module) {
   if (mlir::failed(mlir::egraph::applyEGraphPatternsAndExtract(
           originalBlock, patterns,
           mlir::egraph::EGraphExtractMode::LinearProgramming,
-          getDemoExtractCost)))
-    return module.emitError("failed to optimize @arith_demo");
+          getExampleExtractCost)))
+    return module.emitError("failed to optimize @arith_example");
 
   llvm::outs() << "Optimized IR:\n";
   module.print(llvm::outs());
@@ -148,8 +148,8 @@ int main(int argc, char **argv) {
 
   llvm::cl::opt<std::string> inputFilename(
       llvm::cl::Positional, llvm::cl::desc("<input mlir>"),
-      llvm::cl::init(ARITH_DEMO_INPUT));
-  llvm::cl::ParseCommandLineOptions(argc, argv, "MLIR-EGraph arith demo\n");
+      llvm::cl::init(ARITH_EXAMPLE_INPUT));
+  llvm::cl::ParseCommandLineOptions(argc, argv, "MLIR-EGraph arith example\n");
 
   mlir::DialectRegistry registry;
   registry.insert<mlir::arith::ArithDialect, mlir::egraph::EGraphDialect,
@@ -164,5 +164,5 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  return mlir::failed(runDemo(*module)) ? 1 : 0;
+  return mlir::failed(runExample(*module)) ? 1 : 0;
 }

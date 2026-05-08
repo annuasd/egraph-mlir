@@ -1,5 +1,5 @@
 module {
-  func.func @transpose_demo(
+  func.func @transpose_example(
       %a: tensor<30x40x20xf32>,
       %b: tensor<30x20x40xf32>) -> tensor<30x40x20xf32> {
     %ta = tosa.transpose %a {perms = array<i32: 2, 0, 1>}

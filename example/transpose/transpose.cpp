@@ -15,8 +15,8 @@
 #include "llvm/Support/raw_ostream.h"
 #include <cstdint>
 
-#ifndef TRANSPOSE_DEMO_INPUT
-#define TRANSPOSE_DEMO_INPUT "demo/transpose/transpose.mlir"
+#ifndef TRANSPOSE_EXAMPLE_INPUT
+#define TRANSPOSE_EXAMPLE_INPUT "example/transpose/transpose.mlir"
 #endif
 
 namespace {
@@ -85,7 +85,7 @@ composePermutations(llvm::ArrayRef<int32_t> first,
 }
 
 mlir::FailureOr<mlir::egraph::EGraphExtractCost>
-getDemoExtractCost(mlir::Operation *op) {
+getExampleExtractCost(mlir::Operation *op) {
   if (llvm::isa<mlir::tosa::TransposeOp>(op))
     return mlir::egraph::EGraphExtractCost(16);
   if (llvm::isa<mlir::tosa::MaximumOp>(op))
@@ -340,10 +340,10 @@ struct CombineTransposeBinaryPattern final
   }
 };
 
-mlir::LogicalResult runDemo(mlir::ModuleOp module) {
-  auto originalFunc = module.lookupSymbol<mlir::func::FuncOp>("transpose_demo");
+mlir::LogicalResult runExample(mlir::ModuleOp module) {
+  auto originalFunc = module.lookupSymbol<mlir::func::FuncOp>("transpose_example");
   if (!originalFunc)
-    return module.emitError("expected a func.func named @transpose_demo");
+    return module.emitError("expected a func.func named @transpose_example");
   mlir::Block &originalBlock = originalFunc.getBody().front();
 
   mlir::egraph::EGraphPatternSet patterns;
@@ -359,8 +359,8 @@ mlir::LogicalResult runDemo(mlir::ModuleOp module) {
   if (mlir::failed(mlir::egraph::applyEGraphPatternsAndExtract(
           originalBlock, patterns,
           mlir::egraph::EGraphExtractMode::LinearProgramming,
-          getDemoExtractCost)))
-    return module.emitError("failed to optimize @transpose_demo");
+          getExampleExtractCost)))
+    return module.emitError("failed to optimize @transpose_example");
 
   llvm::outs() << "Optimized IR:\n";
   module.print(llvm::outs());
@@ -375,9 +375,9 @@ int main(int argc, char **argv) {
 
   llvm::cl::opt<std::string> inputFilename(
       llvm::cl::Positional, llvm::cl::desc("<input mlir>"),
-      llvm::cl::init(TRANSPOSE_DEMO_INPUT));
+      llvm::cl::init(TRANSPOSE_EXAMPLE_INPUT));
   llvm::cl::ParseCommandLineOptions(argc, argv,
-                                    "MLIR-EGraph TOSA transpose demo\n");
+                                    "MLIR-EGraph TOSA transpose example\n");
 
   mlir::DialectRegistry registry;
   registry.insert<mlir::egraph::EGraphDialect, mlir::func::FuncDialect,
@@ -392,5 +392,5 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  return mlir::failed(runDemo(*module)) ? 1 : 0;
+  return mlir::failed(runExample(*module)) ? 1 : 0;
 }

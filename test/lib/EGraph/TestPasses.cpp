@@ -2745,9 +2745,9 @@ bool hasMulOfDivDef(mlir::egraph::EValue value, mlir::egraph::EValue mulLhs,
   return false;
 }
 
-struct DemoMulByTwoToShiftPattern final
+struct ExampleMulByTwoToShiftPattern final
     : public mlir::egraph::EGraphPatternFor<mlir::arith::MulIOp> {
-  explicit DemoMulByTwoToShiftPattern(unsigned &matchCount)
+  explicit ExampleMulByTwoToShiftPattern(unsigned &matchCount)
       : matchCount(matchCount) {}
 
   mlir::LogicalResult
@@ -2785,9 +2785,9 @@ private:
   unsigned &matchCount;
 };
 
-struct DemoReassociateDivPattern final
+struct ExampleReassociateDivPattern final
     : public mlir::egraph::EGraphPatternFor<mlir::arith::DivSIOp> {
-  explicit DemoReassociateDivPattern(unsigned &matchCount)
+  explicit ExampleReassociateDivPattern(unsigned &matchCount)
       : matchCount(matchCount) {}
 
   mlir::LogicalResult
@@ -2814,9 +2814,9 @@ private:
   unsigned &matchCount;
 };
 
-struct DemoDivSelfToOnePattern final
+struct ExampleDivSelfToOnePattern final
     : public mlir::egraph::EGraphPatternFor<mlir::arith::DivSIOp> {
-  explicit DemoDivSelfToOnePattern(unsigned &matchCount)
+  explicit ExampleDivSelfToOnePattern(unsigned &matchCount)
       : matchCount(matchCount) {}
 
   mlir::LogicalResult
@@ -2838,9 +2838,9 @@ private:
   unsigned &matchCount;
 };
 
-struct DemoMulByOneToAliasPattern final
+struct ExampleMulByOneToAliasPattern final
     : public mlir::egraph::EGraphPatternFor<mlir::arith::MulIOp> {
-  explicit DemoMulByOneToAliasPattern(unsigned &matchCount)
+  explicit ExampleMulByOneToAliasPattern(unsigned &matchCount)
       : matchCount(matchCount) {}
 
   mlir::LogicalResult
@@ -2871,7 +2871,7 @@ private:
 };
 
 mlir::FailureOr<mlir::egraph::EGraphExtractCost>
-getDemoExtractCost(mlir::Operation *candidate) {
+getExampleExtractCost(mlir::Operation *candidate) {
   llvm::StringRef operationName = candidate->getName().getStringRef();
   if (operationName == mlir::arith::ConstantOp::getOperationName())
     return mlir::egraph::EGraphExtractCost(1);
@@ -2885,75 +2885,75 @@ getDemoExtractCost(mlir::Operation *candidate) {
 }
 
 mlir::LogicalResult runMatchAndExtractPipeline(mlir::ModuleOp module) {
-  auto demoFunc = module.lookupSymbol<mlir::func::FuncOp>("arith_demo");
-  if (!demoFunc)
-    return module.emitError("expected a demo func.func named @arith_demo");
+  auto exampleFunc = module.lookupSymbol<mlir::func::FuncOp>("arith_example");
+  if (!exampleFunc)
+    return module.emitError("expected an example func.func named @arith_example");
 
   unsigned mulByTwoMatches = 0;
   unsigned reassociateMatches = 0;
   unsigned divSelfMatches = 0;
   unsigned mulByOneMatches = 0;
   mlir::egraph::EGraphPatternSet patterns;
-  patterns.add<DemoMulByTwoToShiftPattern>(mulByTwoMatches);
-  patterns.add<DemoReassociateDivPattern>(reassociateMatches);
-  patterns.add<DemoDivSelfToOnePattern>(divSelfMatches);
-  patterns.add<DemoMulByOneToAliasPattern>(mulByOneMatches);
+  patterns.add<ExampleMulByTwoToShiftPattern>(mulByTwoMatches);
+  patterns.add<ExampleReassociateDivPattern>(reassociateMatches);
+  patterns.add<ExampleDivSelfToOnePattern>(divSelfMatches);
+  patterns.add<ExampleMulByOneToAliasPattern>(mulByOneMatches);
 
-  mlir::Operation *demoOp = demoFunc.getOperation();
+  mlir::Operation *exampleOp = exampleFunc.getOperation();
   if (mlir::failed(mlir::egraph::applyEGraphPatternsAndExtract(
-          demoOp, patterns, mlir::egraph::EGraphExtractMode::Greedy,
-          getDemoExtractCost, {}, /*recurseIntoNestedBlocks=*/false)))
+          exampleOp, patterns, mlir::egraph::EGraphExtractMode::Greedy,
+          getExampleExtractCost, {}, /*recurseIntoNestedBlocks=*/false)))
     return module.emitError("egraph match/extract pipeline failed");
 
   if (mulByTwoMatches == 0 || reassociateMatches == 0 || divSelfMatches == 0 ||
       mulByOneMatches == 0)
     return module.emitError(
-        "egraph match/extract did not exercise all demo patterns");
+        "egraph match/extract did not exercise all example patterns");
 
-  mlir::Block &block = demoFunc.getBody().front();
+  mlir::Block &block = exampleFunc.getBody().front();
   auto returnOp =
       llvm::dyn_cast_or_null<mlir::func::ReturnOp>(block.getTerminator());
   if (!returnOp || returnOp.getNumOperands() != 1 ||
       returnOp.getOperand(0) != block.getArgument(0))
     return module.emitError(
-        "egraph match/extract did not simplify the demo root to arg0");
+        "egraph match/extract did not simplify the example root to arg0");
   if (block.getOperations().size() != 1)
     return module.emitError(
-        "egraph match/extract left redundant operations in the demo block");
+        "egraph match/extract left redundant operations in the example block");
 
-  module.emitRemark() << "egraph pipeline matched and extracted arith demo";
+  module.emitRemark() << "egraph pipeline matched and extracted arith example";
   return mlir::success();
 }
 
 mlir::LogicalResult runRecursiveMatchAndExtractPipeline(mlir::ModuleOp module) {
-  auto demoFunc = module.lookupSymbol<mlir::func::FuncOp>("nested_demo");
-  if (!demoFunc)
-    return module.emitError("expected a demo func.func named @nested_demo");
+  auto exampleFunc = module.lookupSymbol<mlir::func::FuncOp>("nested_example");
+  if (!exampleFunc)
+    return module.emitError("expected an example func.func named @nested_example");
 
   unsigned mulByTwoMatches = 0;
   unsigned reassociateMatches = 0;
   unsigned divSelfMatches = 0;
   unsigned mulByOneMatches = 0;
   mlir::egraph::EGraphPatternSet patterns;
-  patterns.add<DemoMulByTwoToShiftPattern>(mulByTwoMatches);
-  patterns.add<DemoReassociateDivPattern>(reassociateMatches);
-  patterns.add<DemoDivSelfToOnePattern>(divSelfMatches);
-  patterns.add<DemoMulByOneToAliasPattern>(mulByOneMatches);
+  patterns.add<ExampleMulByTwoToShiftPattern>(mulByTwoMatches);
+  patterns.add<ExampleReassociateDivPattern>(reassociateMatches);
+  patterns.add<ExampleDivSelfToOnePattern>(divSelfMatches);
+  patterns.add<ExampleMulByOneToAliasPattern>(mulByOneMatches);
 
-  mlir::Operation *demoOp = demoFunc.getOperation();
+  mlir::Operation *exampleOp = exampleFunc.getOperation();
   mlir::egraph::EGraphMatchConfig config;
   if (mlir::failed(mlir::egraph::applyEGraphPatternsAndExtract(
-          demoOp, patterns, mlir::egraph::EGraphExtractMode::Greedy,
-          getDemoExtractCost, config, /*recurseIntoNestedBlocks=*/true)))
+          exampleOp, patterns, mlir::egraph::EGraphExtractMode::Greedy,
+          getExampleExtractCost, config, /*recurseIntoNestedBlocks=*/true)))
     return module.emitError("recursive egraph match/extract pipeline failed");
 
   if (mulByTwoMatches == 0 || reassociateMatches == 0 || divSelfMatches == 0 ||
       mulByOneMatches == 0)
     return module.emitError(
-        "recursive egraph match/extract did not exercise all demo patterns");
+        "recursive egraph match/extract did not exercise all example patterns");
 
   module.emitRemark()
-      << "egraph recursive pipeline matched and extracted nested arith demo";
+      << "egraph recursive pipeline matched and extracted nested arith example";
   return mlir::success();
 }
 
