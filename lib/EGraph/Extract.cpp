@@ -113,44 +113,6 @@ FailureOr<EGraphExtractCost> addExtractCosts(EGraphExtractCost lhs,
   return lhs + rhs;
 }
 
-FailureOr<std::pair<EOpRefBase, EGraphExtractCost>>
-selectBestCandidateForRoot(EGraph &graph, EValue root,
-                           EGraphExtractCostModel costModel) {
-  if (!root || root.getGraph() != &graph || !root.getSymbolNameAttr())
-    return failure();
-
-  EValue leader = root.getLeader();
-  if (!leader.getSymbolNameAttr() || leader.getResultIndex() != 0)
-    return failure();
-
-  SmallVector<EOpRefBase, 4> candidates = graph.getCandidateRoots(leader);
-  if (candidates.empty())
-    return failure();
-
-  bool hasBestCandidate = false;
-  EOpRefBase bestCandidate;
-  EGraphExtractCost bestCost = 0;
-  for (EOpRefBase candidate : candidates) {
-    Operation *operation = candidate.getOperation();
-    if (!operation)
-      continue;
-
-    FailureOr<EGraphExtractCost> candidateCost = costModel(operation);
-    if (failed(candidateCost))
-      continue;
-
-    if (!hasBestCandidate || *candidateCost < bestCost) {
-      hasBestCandidate = true;
-      bestCandidate = candidate;
-      bestCost = *candidateCost;
-    }
-  }
-
-  if (!hasBestCandidate)
-    return failure();
-  return std::make_pair(bestCandidate, bestCost);
-}
-
 class GreedyEGraphExtractor {
 public:
   GreedyEGraphExtractor(EGraph &graph, EGraphOp egraph,
