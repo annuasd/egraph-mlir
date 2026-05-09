@@ -52,6 +52,20 @@ LogicalResult extractEGraph(GraphMatchState &state, EGraphExtractMode mode,
                             ArrayRef<EValue> explicitRoots = {},
                             EGraphExtractInfo *info = nullptr);
 
+/// Extracts from a symbolic egraph container and returns the selected
+/// candidates without materializing them into a block.
+LogicalResult extractEGraph(EGraph &graph, EGraphOp egraph,
+                            EGraphExtractMode mode,
+                            EGraphExtractCostModel costModel,
+                            EGraphExtractInfo *info = nullptr,
+                            ArrayRef<EValue> explicitRoots = {});
+
+/// Materializes an extraction selection into ordinary MLIR values.
+FailureOr<SmallVector<Value, 4>>
+materializeEGraphExtractInfo(EGraph &graph, EGraphOp egraph,
+                             const EGraphExtractInfo &selection,
+                             OpBuilder &builder, ArrayRef<Value> inputValues);
+
 } // namespace egraph
 } // namespace mlir
 

@@ -18,21 +18,6 @@
 using namespace mlir;
 using namespace mlir::egraph;
 
-namespace mlir {
-namespace egraph {
-LogicalResult extractEGraphForTesting(EGraph &graph, EGraphOp egraph,
-                                      EGraphExtractMode mode,
-                                      EGraphExtractCostModel costModel,
-                                      EGraphExtractInfo *info,
-                                      ArrayRef<EValue> explicitRoots);
-FailureOr<SmallVector<Value, 4>>
-materializeEGraphExtractInfoForTesting(EGraph &graph, EGraphOp egraph,
-                                       const EGraphExtractInfo &selection,
-                                       OpBuilder &builder,
-                                       ArrayRef<Value> inputValues);
-} // namespace egraph
-} // namespace mlir
-
 namespace {
 FailureOr<SmallVector<FlatSymbolRefAttr, 4>>
 readCandidateSymbolRefs(EClassOp eclass, unsigned candidateOrdinal) {
@@ -1189,8 +1174,7 @@ StringRef mlir::egraph::stringifyEGraphExtractMode(EGraphExtractMode mode) {
 
 static FailureOr<EGraphExtractRequest>
 buildExtractRequest(EGraph &graph, EGraphOp egraph,
-                    ArrayRef<EValue> explicitRoots,
-                    EGraphExtractMode mode) {
+                    ArrayRef<EValue> explicitRoots, EGraphExtractMode mode) {
   if (!egraph || egraph.isExternal() || egraph.getBody().empty())
     return failure();
 
@@ -1243,10 +1227,11 @@ runLinearProgrammingExtract(EGraph &graph, EGraphOp egraph,
 #endif
 }
 
-LogicalResult mlir::egraph::extractEGraphForTesting(
-    EGraph &graph, EGraphOp egraph, EGraphExtractMode mode,
-    EGraphExtractCostModel costModel, EGraphExtractInfo *info,
-    ArrayRef<EValue> explicitRoots) {
+LogicalResult mlir::egraph::extractEGraph(EGraph &graph, EGraphOp egraph,
+                                          EGraphExtractMode mode,
+                                          EGraphExtractCostModel costModel,
+                                          EGraphExtractInfo *info,
+                                          ArrayRef<EValue> explicitRoots) {
   FailureOr<EGraphExtractRequest> request =
       buildExtractRequest(graph, egraph, explicitRoots, mode);
   if (failed(request))
@@ -1269,8 +1254,7 @@ LogicalResult mlir::egraph::extractEGraphForTesting(
   return success();
 }
 
-FailureOr<SmallVector<Value, 4>>
-mlir::egraph::materializeEGraphExtractInfoForTesting(
+FailureOr<SmallVector<Value, 4>> mlir::egraph::materializeEGraphExtractInfo(
     EGraph &graph, EGraphOp egraph, const EGraphExtractInfo &selection,
     OpBuilder &builder, ArrayRef<Value> inputValues) {
   return materializeExtractSelection(graph, egraph, selection, builder,
@@ -1302,8 +1286,8 @@ LogicalResult mlir::egraph::extractEGraph(GraphMatchState &state,
     selection = runGreedyExtract(*state.graph, egraph, *request, costModel);
     break;
   case EGraphExtractMode::LinearProgramming:
-    selection = runLinearProgrammingExtract(*state.graph, egraph, *request,
-                                            costModel);
+    selection =
+        runLinearProgrammingExtract(*state.graph, egraph, *request, costModel);
     break;
   }
   if (failed(selection))
@@ -1323,9 +1307,8 @@ LogicalResult mlir::egraph::extractEGraph(GraphMatchState &state,
 
   SmallVector<Value, 4> inputValues(block.getArguments().begin(),
                                     block.getArguments().end());
-  FailureOr<SmallVector<Value, 4>> roots =
-      materializeExtractSelection(*state.graph, egraph, *selection, builder,
-                                 inputValues);
+  FailureOr<SmallVector<Value, 4>> roots = materializeExtractSelection(
+      *state.graph, egraph, *selection, builder, inputValues);
   if (failed(roots)) {
     for (Operation *op = terminator->getPrevNode(); op && op != oldTail;) {
       Operation *previous = op->getPrevNode();

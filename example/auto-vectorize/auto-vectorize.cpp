@@ -88,6 +88,29 @@ mlir::ArrayAttr getPackedKMatmulIndexingMaps(mlir::Builder &builder) {
   return getAffineMapArrayAttr(builder, maps);
 }
 
+mlir::ArrayAttr getMatmulIndexingMaps(mlir::Builder &builder) {
+  mlir::MLIRContext *context = builder.getContext();
+  mlir::AffineExpr m = builder.getAffineDimExpr(0);
+  mlir::AffineExpr n = builder.getAffineDimExpr(1);
+  mlir::AffineExpr k = builder.getAffineDimExpr(2);
+
+  llvm::SmallVector<mlir::AffineMap, 3> maps = {
+      mlir::AffineMap::get(3, 0, {m, k}, context),
+      mlir::AffineMap::get(3, 0, {k, n}, context),
+      mlir::AffineMap::get(3, 0, {m, n}, context),
+  };
+  return getAffineMapArrayAttr(builder, maps);
+}
+
+mlir::ArrayAttr getMatmulIteratorTypes(mlir::Builder &builder) {
+  llvm::SmallVector<mlir::vector::IteratorType, 3> iteratorTypes = {
+      mlir::vector::IteratorType::parallel,
+      mlir::vector::IteratorType::parallel,
+      mlir::vector::IteratorType::reduction,
+  };
+  return getIteratorTypeArrayAttr(builder, iteratorTypes);
+}
+
 mlir::ArrayAttr getPackedKMatmulIteratorTypes(mlir::Builder &builder) {
   llvm::SmallVector<mlir::vector::IteratorType, 4> iteratorTypes = {
       mlir::vector::IteratorType::parallel,
@@ -96,6 +119,20 @@ mlir::ArrayAttr getPackedKMatmulIteratorTypes(mlir::Builder &builder) {
       mlir::vector::IteratorType::reduction,
   };
   return getIteratorTypeArrayAttr(builder, iteratorTypes);
+}
+
+bool hasStandardMatmulAttrs(mlir::vector::ContractionOp op) {
+  mlir::Builder builder(op.getOperation()->getContext());
+  return op.getIndexingMaps() == getMatmulIndexingMaps(builder) &&
+         op.getIteratorTypes() == getMatmulIteratorTypes(builder) &&
+         op.getKind() == mlir::vector::CombiningKind::ADD;
+}
+
+bool hasPackedKMatmulAttrs(mlir::vector::ContractionOp op) {
+  mlir::Builder builder(op.getOperation()->getContext());
+  return op.getIndexingMaps() == getPackedKMatmulIndexingMaps(builder) &&
+         op.getIteratorTypes() == getPackedKMatmulIteratorTypes(builder) &&
+         op.getKind() == mlir::vector::CombiningKind::ADD;
 }
 
 bool hasExpDef(mlir::egraph::EValue value) {
@@ -111,7 +148,8 @@ bool isUnpackedValueMatmul(mlir::vector::ContractionOp op) {
          hasVectorShape(op.getRhs().getType(), {kValueK, kValueN}) &&
          hasVectorShape(op.getAcc().getType(), {kRows, kValueN}) &&
          hasVectorShape(op.getOperation()->getResult(0).getType(),
-                        {kRows, kValueN});
+                        {kRows, kValueN}) &&
+         hasStandardMatmulAttrs(op);
 }
 
 bool isPackedKValueMatmul(mlir::vector::ContractionOp op) {
@@ -119,7 +157,8 @@ bool isPackedKValueMatmul(mlir::vector::ContractionOp op) {
          hasVectorShape(op.getRhs().getType(), {kPackedK, kLane, kValueN}) &&
          hasVectorShape(op.getAcc().getType(), {kRows, kValueN}) &&
          hasVectorShape(op.getOperation()->getResult(0).getType(),
-                        {kRows, kValueN});
+                        {kRows, kValueN}) &&
+         hasPackedKMatmulAttrs(op);
 }
 
 mlir::FailureOr<mlir::egraph::EGraphExtractCost>
@@ -167,7 +206,9 @@ struct VectorizeValueMatmulPattern final
         packedRhs.getResult(), contract.getAcc(),
         getPackedKMatmulIndexingMaps(rewriter),
         getPackedKMatmulIteratorTypes(rewriter),
-        mlir::vector::CombiningKind::ADD, mlir::arith::FastMathFlags::none);
+        mlir::vector::CombiningKindAttr::get(rewriter.getContext(),
+                                             contract.getKind()),
+        contract.getFastmathAttr());
     return rewriter.replaceOp(root, replacement->getResults());
   }
 };
@@ -192,7 +233,7 @@ struct PackExpPropagationPattern final
               exp.getOperand());
           auto replacement = mlir::math::ExpOp::create(
               rewriter, root.getLoc(), pack.getResult().getType(),
-              packedInput.getResult(), mlir::arith::FastMathFlagsAttr{});
+              packedInput.getResult(), exp.getFastmathAttr());
           return rewriter.replaceOp(root, replacement->getResults());
         });
   }
@@ -218,7 +259,7 @@ struct UnpackExpPropagationPattern final
 
           auto unpackedExp = mlir::math::ExpOp::create(
               rewriter, root.getLoc(), pack.getSource().getType(),
-              pack.getSource(), mlir::arith::FastMathFlagsAttr{});
+              pack.getSource(), exp.getFastmathAttr());
           auto replacement = mlir::vector::ShapeCastOp::create(
               rewriter, root.getLoc(), exp.getResult().getType(),
               unpackedExp.getResult());
