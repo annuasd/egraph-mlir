@@ -8,6 +8,8 @@
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/IR/ValueRange.h"
 #include "mlir/Support/LLVM.h"
+#include "mlir/Support/TypeID.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
@@ -227,20 +229,46 @@ private:
   EGraphRewriteTransaction *transaction = nullptr;
 };
 
+enum class EGraphPatternRootKind {
+  Any,
+  OperationName,
+  TraitID,
+  InterfaceID,
+};
+
 class EGraphPattern {
 public:
   virtual ~EGraphPattern() = default;
 
-  /// Returns the root operation name this pattern matches.
-  virtual StringRef getRootOperationName() const = 0;
+  /// Returns how this pattern chooses root operations.
+  virtual EGraphPatternRootKind getRootKind() const = 0;
+  /// Returns the root operation name for operation-name rooted patterns.
+  virtual StringRef getRootOperationName() const { return {}; }
+  /// Returns the root trait ID for trait-rooted patterns.
+  virtual TypeID getRootTraitID() const { return TypeID(); }
+  /// Returns the root interface ID for interface-rooted patterns.
+  virtual TypeID getRootInterfaceID() const { return TypeID(); }
   /// Matches and rewrites a live egraph operation occurrence.
   virtual LogicalResult
   matchAndRewrite(EOpRefBase root, EGraphPatternRewriter &rewriter) const = 0;
 };
 
+class EGraphAnyOpPattern : public EGraphPattern {
+public:
+  /// Matches any operation type. The concrete pattern performs final checks.
+  EGraphPatternRootKind getRootKind() const final {
+    return EGraphPatternRootKind::Any;
+  }
+};
+
 template <typename OpTy>
 class EGraphPatternFor : public EGraphPattern {
 public:
+  /// Matches only the requested operation type.
+  EGraphPatternRootKind getRootKind() const final {
+    return EGraphPatternRootKind::OperationName;
+  }
+
   /// Returns the operation name of the wrapped root operation type.
   StringRef getRootOperationName() const final {
     return OpTy::getOperationName();
@@ -259,12 +287,75 @@ public:
   matchAndRewrite(EOpRef<OpTy> root, EGraphPatternRewriter &rewriter) const = 0;
 };
 
+template <template <typename> class TraitTy>
+class EGraphTraitPattern : public EGraphPattern {
+public:
+  /// Matches operations registered with the requested trait.
+  EGraphPatternRootKind getRootKind() const final {
+    return EGraphPatternRootKind::TraitID;
+  }
+
+  /// Returns the TypeID of the requested root trait.
+  TypeID getRootTraitID() const final { return TypeID::get<TraitTy>(); }
+
+  /// Rechecks the trait before invoking the concrete pattern.
+  LogicalResult matchAndRewrite(EOpRefBase root,
+                                EGraphPatternRewriter &rewriter) const final {
+    if (!root || !root.getOperation()->hasTrait<TraitTy>())
+      return failure();
+    return matchTraitRoot(root, rewriter);
+  }
+
+  /// Rewrites a live root occurrence with the requested trait.
+  virtual LogicalResult
+  matchTraitRoot(EOpRefBase root, EGraphPatternRewriter &rewriter) const = 0;
+};
+
+template <typename InterfaceTy>
+class EGraphInterfacePattern : public EGraphPattern {
+public:
+  /// Matches operations implementing the requested interface.
+  EGraphPatternRootKind getRootKind() const final {
+    return EGraphPatternRootKind::InterfaceID;
+  }
+
+  /// Returns the TypeID of the requested root interface.
+  TypeID getRootInterfaceID() const final { return InterfaceTy::getInterfaceID(); }
+
+  /// Rechecks the interface before invoking the concrete pattern.
+  LogicalResult matchAndRewrite(EOpRefBase root,
+                                EGraphPatternRewriter &rewriter) const final {
+    if (!root ||
+        !root.getOperation()->getName().hasInterface(getRootInterfaceID()))
+      return failure();
+    return matchInterfaceRoot(root, rewriter);
+  }
+
+  /// Rewrites a live root occurrence implementing the requested interface.
+  virtual LogicalResult
+  matchInterfaceRoot(EOpRefBase root, EGraphPatternRewriter &rewriter) const = 0;
+};
+
 class EGraphPatternSet {
 public:
-  /// Adds an owned pattern to the set and indexes it by root operation name.
+  /// Adds an owned pattern and indexes it by root dispatch kind.
   void add(std::unique_ptr<EGraphPattern> pattern) {
     EGraphPattern *rawPattern = pattern.get();
-    patternsByRoot[rawPattern->getRootOperationName()].push_back(rawPattern);
+    switch (rawPattern->getRootKind()) {
+    case EGraphPatternRootKind::Any:
+      anyRootPatterns.push_back(rawPattern);
+      break;
+    case EGraphPatternRootKind::OperationName:
+      patternsByRoot[rawPattern->getRootOperationName()].push_back(rawPattern);
+      break;
+    case EGraphPatternRootKind::TraitID:
+      patternsByTrait[rawPattern->getRootTraitID()].push_back(rawPattern);
+      break;
+    case EGraphPatternRootKind::InterfaceID:
+      patternsByInterface[rawPattern->getRootInterfaceID()].push_back(
+          rawPattern);
+      break;
+    }
     ownedPatterns.push_back(std::move(pattern));
   }
 
@@ -278,7 +369,7 @@ public:
     return result;
   }
 
-  /// Returns the patterns registered for the given root operation name.
+  /// Returns exact operation-name rooted patterns for the given root name.
   ArrayRef<EGraphPattern *> lookup(StringRef operationName) const {
     auto it = patternsByRoot.find(operationName);
     if (it == patternsByRoot.end())
@@ -286,9 +377,33 @@ public:
     return it->second;
   }
 
+  /// Appends patterns that may match the given operation.
+  void lookup(Operation *operation,
+              SmallVectorImpl<EGraphPattern *> &result) const {
+    if (!operation)
+      return;
+
+    ArrayRef<EGraphPattern *> exactPatterns =
+        lookup(operation->getName().getStringRef());
+    result.append(exactPatterns.begin(), exactPatterns.end());
+
+    for (const auto &it : patternsByTrait)
+      if (operation->getName().hasTrait(it.first))
+        result.append(it.second.begin(), it.second.end());
+
+    for (const auto &it : patternsByInterface)
+      if (operation->getName().hasInterface(it.first))
+        result.append(it.second.begin(), it.second.end());
+
+    result.append(anyRootPatterns.begin(), anyRootPatterns.end());
+  }
+
 private:
   std::vector<std::unique_ptr<EGraphPattern>> ownedPatterns;
+  SmallVector<EGraphPattern *> anyRootPatterns;
   llvm::StringMap<SmallVector<EGraphPattern *>> patternsByRoot;
+  llvm::DenseMap<TypeID, SmallVector<EGraphPattern *>> patternsByTrait;
+  llvm::DenseMap<TypeID, SmallVector<EGraphPattern *>> patternsByInterface;
 };
 
 /// Applies egraph patterns to exactly one block.

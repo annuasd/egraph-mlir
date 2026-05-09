@@ -37,6 +37,7 @@ tools = [
     "FileCheck",
     "count",
     "mlir-egraph-opt",
+    "transpose-example",
     "not",
 ]
 

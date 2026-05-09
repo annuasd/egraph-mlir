@@ -6,6 +6,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/OperationSupport.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/Parser/Parser.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -84,13 +85,31 @@ composePermutations(llvm::ArrayRef<int32_t> first,
   return composed;
 }
 
+bool isTosaElementwiseUnaryOp(mlir::Operation *op) {
+  return op && op->getNumOperands() == 1 && op->getNumResults() == 1 &&
+         op->hasTrait<mlir::OpTrait::tosa::TosaElementwiseOperator>() &&
+         op->hasTrait<mlir::OpTrait::SameOperandsAndResultShape>() &&
+         op->hasTrait<mlir::OpTrait::SameOperandsAndResultElementType>();
+}
+
+mlir::Operation *
+createUnaryLikeOp(mlir::egraph::EGraphPatternRewriter &rewriter,
+                  mlir::Operation *source, mlir::Location loc,
+                  mlir::Type resultType, mlir::Value operand) {
+  llvm::SmallVector<mlir::Value, 1> operands = {operand};
+  llvm::SmallVector<mlir::Type, 1> resultTypes = {resultType};
+  mlir::OperationState state(loc, source->getName(), operands, resultTypes,
+                             source->getAttrs());
+  return rewriter.create(state);
+}
+
 mlir::FailureOr<mlir::egraph::EGraphExtractCost>
 getExampleExtractCost(mlir::Operation *op) {
   if (llvm::isa<mlir::tosa::TransposeOp>(op))
     return mlir::egraph::EGraphExtractCost(16);
   if (llvm::isa<mlir::tosa::MaximumOp>(op))
     return mlir::egraph::EGraphExtractCost(1);
-  if (llvm::isa<mlir::tosa::ExpOp>(op))
+  if (isTosaElementwiseUnaryOp(op))
     return mlir::egraph::EGraphExtractCost(1);
   return mlir::egraph::EGraphExtractCost(4);
 }
@@ -137,10 +156,15 @@ struct FoldTwoTransposesPattern final
 
 // unary(transpose(x, p)) => transpose(unary(x), p).
 struct CombineTransposeUnaryPattern final
-    : public mlir::egraph::EGraphPatternFor<mlir::tosa::ExpOp> {
+    : public mlir::egraph::EGraphTraitPattern<
+          mlir::OpTrait::tosa::TosaElementwiseOperator> {
   mlir::LogicalResult
-  matchAndRewrite(mlir::egraph::EOpRef<mlir::tosa::ExpOp> root,
-                  mlir::egraph::EGraphPatternRewriter &rewriter) const final {
+  matchTraitRoot(mlir::egraph::EOpRefBase root,
+                 mlir::egraph::EGraphPatternRewriter &rewriter) const final {
+    mlir::Operation *unary = root.getOperation();
+    if (!isTosaElementwiseUnaryOp(unary))
+      return mlir::failure();
+
     return root.getOperand(0).matchDef<mlir::tosa::TransposeOp>(
         [&](mlir::egraph::EOpRef<mlir::tosa::TransposeOp> transposeRef) {
           mlir::tosa::TransposeOp transpose = transposeRef.getOp();
@@ -155,8 +179,9 @@ struct CombineTransposeUnaryPattern final
           if (mlir::failed(transposedType))
             return mlir::failure();
 
-          auto replacement = mlir::tosa::ExpOp::create(rewriter, root.getLoc(),
-                                                       inputType, input);
+          mlir::Operation *replacement =
+              createUnaryLikeOp(rewriter, unary, root.getLoc(), inputType,
+                                input);
           auto outerTranspose = mlir::tosa::TransposeOp::create(
               rewriter, root.getLoc(), *transposedType,
               replacement->getResult(0), transpose.getPerms());
@@ -172,9 +197,13 @@ struct CombineUnaryTransposePattern final
   matchAndRewrite(mlir::egraph::EOpRef<mlir::tosa::TransposeOp> root,
                   mlir::egraph::EGraphPatternRewriter &rewriter) const final {
     mlir::tosa::TransposeOp transpose = root.getOp();
-    return root.getOperand(0).matchDef<mlir::tosa::ExpOp>(
-        [&](mlir::egraph::EOpRef<mlir::tosa::ExpOp> unaryRef) {
-          mlir::Value input = unaryRef.getOperation()->getOperand(0);
+    return root.getOperand(0).matchDef(
+        [&](mlir::egraph::EOpRefBase unaryRef) -> mlir::LogicalResult {
+          mlir::Operation *unary = unaryRef.getOperation();
+          if (!isTosaElementwiseUnaryOp(unary))
+            return mlir::failure();
+
+          mlir::Value input = unary->getOperand(0);
           mlir::FailureOr<mlir::RankedTensorType> transposedType =
               getPermutedTensorType(input.getType(), transpose.getPerms());
           if (mlir::failed(transposedType))
@@ -183,8 +212,8 @@ struct CombineUnaryTransposePattern final
           auto innerTranspose = mlir::tosa::TransposeOp::create(
               rewriter, root.getLoc(), *transposedType, input,
               transpose.getPerms());
-          auto replacement = mlir::tosa::ExpOp::create(
-              rewriter, root.getLoc(), *transposedType,
+          mlir::Operation *replacement = createUnaryLikeOp(
+              rewriter, unary, root.getLoc(), *transposedType,
               innerTranspose->getResult(0));
           return rewriter.replaceOp(root, replacement->getResults());
         });

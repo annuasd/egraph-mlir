@@ -1157,8 +1157,8 @@ runEGraphMatchDriver(EGraph &graph, const EGraphPatternSet &patterns,
     assert(graph.isClean() &&
            "worklist driver must only dispatch patterns on a clean egraph");
 
-    ArrayRef<EGraphPattern *> matchingPatterns =
-        patterns.lookup(root.getOperationName());
+    SmallVector<EGraphPattern *, 4> matchingPatterns;
+    patterns.lookup(root.getOperation(), matchingPatterns);
     bool foldedRoot = false;
     if (config.enableMlirFold) {
       auto transaction = std::make_unique<EGraphRewriteTransaction>(

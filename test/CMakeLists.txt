@@ -25,7 +25,8 @@ file(MAKE_DIRECTORY
   ${CMAKE_CURRENT_BINARY_DIR}/IR)
 
 set(MLIR_EGRAPH_TEST_DEPENDS
-  mlir-egraph-opt)
+  mlir-egraph-opt
+  transpose-example)
 set(MLIR_EGRAPH_LIT_SKIP
   "^API(/.*)?$"
   "^Driver(/.*)?$"

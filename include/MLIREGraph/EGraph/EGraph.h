@@ -186,6 +186,9 @@ public:
   template <typename OpTy>
   SmallVector<EOpRef<OpTy>> getDefs() const;
 
+  template <typename Fn>
+  LogicalResult matchDef(Fn &&fn) const;
+
   template <typename OpTy, typename Fn>
   LogicalResult matchDef(Fn &&fn) const;
 
@@ -478,6 +481,28 @@ SmallVector<EOpRef<OpTy>> EValue::getDefs() const {
     refs.push_back(EOpRef<OpTy>(ref));
   }
   return refs;
+}
+
+template <typename Fn>
+LogicalResult EValue::matchDef(Fn &&fn) const {
+  using CallbackResult = std::invoke_result_t<Fn &, EOpRefBase>;
+  static_assert(std::is_same_v<std::decay_t<CallbackResult>, LogicalResult> ||
+                    std::is_same_v<std::decay_t<CallbackResult>, bool> ||
+                    std::is_void_v<CallbackResult>,
+                "matchDef callback must return LogicalResult, bool, or void");
+
+  for (EOpRefBase ref : getDefs()) {
+    if constexpr (std::is_same_v<std::decay_t<CallbackResult>, LogicalResult>) {
+      if (succeeded(fn(ref)))
+        return success();
+    } else if constexpr (std::is_same_v<std::decay_t<CallbackResult>, bool>) {
+      if (fn(ref))
+        return success();
+    } else {
+      fn(ref);
+    }
+  }
+  return failure();
 }
 
 template <typename OpTy, typename Fn>
