@@ -27,6 +27,7 @@ Run the standalone block-level rewrite and extract examples:
 
 ```sh
 build/bin/arith-example
+build/bin/auto-vectorize-example
 build/bin/transpose-example
 ```
 
