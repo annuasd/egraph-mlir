@@ -2,6 +2,7 @@
 #include "MLIREGraph/IR/EGraphDialect.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Tosa/IR/TosaOps.h"
+#include "mlir/Dialect/Traits.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/DialectRegistry.h"
@@ -92,6 +93,49 @@ bool isTosaElementwiseUnaryOp(mlir::Operation *op) {
          op->hasTrait<mlir::OpTrait::SameOperandsAndResultElementType>();
 }
 
+bool isTosaElementwiseBinaryOp(mlir::Operation *op) {
+  return op && op->getNumOperands() == 2 && op->getNumResults() == 1 &&
+         op->hasTrait<mlir::OpTrait::tosa::TosaElementwiseOperator>();
+}
+
+bool hasCompatibleShape(llvm::ArrayRef<int64_t> inferred,
+                        llvm::ArrayRef<int64_t> expected) {
+  if (inferred.size() != expected.size())
+    return false;
+
+  for (size_t i = 0; i < inferred.size(); ++i) {
+    int64_t inferredDim = inferred[i];
+    int64_t expectedDim = expected[i];
+    if (mlir::ShapedType::isDynamic(inferredDim) ||
+        mlir::ShapedType::isDynamic(expectedDim) || inferredDim == expectedDim)
+      continue;
+    return false;
+  }
+  return true;
+}
+
+mlir::LogicalResult verifyBroadcastsToResultType(mlir::Type leftType,
+                                                 mlir::Type rightType,
+                                                 mlir::Type resultType) {
+  auto rankedResult = llvm::dyn_cast<mlir::RankedTensorType>(resultType);
+  if (!rankedResult)
+    return mlir::failure();
+
+  mlir::Type inferred = mlir::OpTrait::util::getBroadcastedType(
+      leftType, rightType, rankedResult.getElementType());
+  if (!inferred)
+    return mlir::failure();
+
+  auto rankedInferred = llvm::dyn_cast<mlir::RankedTensorType>(inferred);
+  if (!rankedInferred)
+    return mlir::failure();
+
+  if (!hasCompatibleShape(rankedInferred.getShape(), rankedResult.getShape()))
+    return mlir::failure();
+
+  return mlir::success();
+}
+
 mlir::Operation *
 createUnaryLikeOp(mlir::egraph::EGraphPatternRewriter &rewriter,
                   mlir::Operation *source, mlir::Location loc,
@@ -103,11 +147,22 @@ createUnaryLikeOp(mlir::egraph::EGraphPatternRewriter &rewriter,
   return rewriter.create(state);
 }
 
+mlir::Operation *
+createBinaryLikeOp(mlir::egraph::EGraphPatternRewriter &rewriter,
+                   mlir::Operation *source, mlir::Location loc,
+                   mlir::Type resultType, mlir::Value lhs, mlir::Value rhs) {
+  llvm::SmallVector<mlir::Value, 2> operands = {lhs, rhs};
+  llvm::SmallVector<mlir::Type, 1> resultTypes = {resultType};
+  mlir::OperationState state(loc, source->getName(), operands, resultTypes,
+                             source->getAttrs());
+  return rewriter.create(state);
+}
+
 mlir::FailureOr<mlir::egraph::EGraphExtractCost>
 getExampleExtractCost(mlir::Operation *op) {
   if (llvm::isa<mlir::tosa::TransposeOp>(op))
     return mlir::egraph::EGraphExtractCost(16);
-  if (llvm::isa<mlir::tosa::MaximumOp>(op))
+  if (isTosaElementwiseBinaryOp(op))
     return mlir::egraph::EGraphExtractCost(1);
   if (isTosaElementwiseUnaryOp(op))
     return mlir::egraph::EGraphExtractCost(1);
@@ -179,9 +234,8 @@ struct CombineTransposeUnaryPattern final
           if (mlir::failed(transposedType))
             return mlir::failure();
 
-          mlir::Operation *replacement =
-              createUnaryLikeOp(rewriter, unary, root.getLoc(), inputType,
-                                input);
+          mlir::Operation *replacement = createUnaryLikeOp(
+              rewriter, unary, root.getLoc(), inputType, input);
           auto outerTranspose = mlir::tosa::TransposeOp::create(
               rewriter, root.getLoc(), *transposedType,
               replacement->getResult(0), transpose.getPerms());
@@ -212,9 +266,9 @@ struct CombineUnaryTransposePattern final
           auto innerTranspose = mlir::tosa::TransposeOp::create(
               rewriter, root.getLoc(), *transposedType, input,
               transpose.getPerms());
-          mlir::Operation *replacement = createUnaryLikeOp(
-              rewriter, unary, root.getLoc(), *transposedType,
-              innerTranspose->getResult(0));
+          mlir::Operation *replacement =
+              createUnaryLikeOp(rewriter, unary, root.getLoc(), *transposedType,
+                                innerTranspose->getResult(0));
           return rewriter.replaceOp(root, replacement->getResults());
         });
   }
@@ -222,11 +276,15 @@ struct CombineUnaryTransposePattern final
 
 // binary(transpose(x, p), transpose(y, p)) => transpose(binary(x, y), p).
 struct CombineBinaryTransposePattern final
-    : public mlir::egraph::EGraphPatternFor<mlir::tosa::MaximumOp> {
+    : public mlir::egraph::EGraphTraitPattern<
+          mlir::OpTrait::tosa::TosaElementwiseOperator> {
   mlir::LogicalResult
-  matchAndRewrite(mlir::egraph::EOpRef<mlir::tosa::MaximumOp> root,
-                  mlir::egraph::EGraphPatternRewriter &rewriter) const final {
-    mlir::tosa::MaximumOp binary = root.getOp();
+  matchTraitRoot(mlir::egraph::EOpRefBase root,
+                 mlir::egraph::EGraphPatternRewriter &rewriter) const final {
+    mlir::Operation *binary = root.getOperation();
+    if (!isTosaElementwiseBinaryOp(binary))
+      return mlir::failure();
+
     return root.getOperand(0).matchDef<mlir::tosa::TransposeOp>(
         [&](mlir::egraph::EOpRef<mlir::tosa::TransposeOp> leftRef) {
           return root.getOperand(1).matchDef<mlir::tosa::TransposeOp>(
@@ -238,17 +296,28 @@ struct CombineBinaryTransposePattern final
 
                 mlir::Value leftInput = leftTranspose.getInput1();
                 mlir::Value rightInput = rightTranspose.getInput1();
-                auto leftType =
-                    llvm::dyn_cast<mlir::RankedTensorType>(leftInput.getType());
-                auto rightType = llvm::dyn_cast<mlir::RankedTensorType>(
-                    rightInput.getType());
-                if (!leftType || !rightType || leftType != rightType)
+
+                mlir::FailureOr<llvm::SmallVector<int32_t, 4>> invPerm =
+                    invertPermutation(leftTranspose.getPerms());
+                if (mlir::failed(invPerm))
                   return mlir::failure();
 
-                auto innerBinary = mlir::tosa::MaximumOp::create(
-                    rewriter, root.getLoc(), leftType, leftInput, rightInput);
+                mlir::FailureOr<mlir::RankedTensorType> resultType =
+                    getPermutedTensorType(binary->getResult(0).getType(),
+                                          *invPerm);
+                if (mlir::failed(resultType))
+                  return mlir::failure();
+
+                if (mlir::failed(verifyBroadcastsToResultType(
+                        leftInput.getType(), rightInput.getType(),
+                        *resultType)))
+                  return mlir::failure();
+
+                mlir::Operation *innerBinary =
+                    createBinaryLikeOp(rewriter, binary, root.getLoc(),
+                                       *resultType, leftInput, rightInput);
                 auto replacement = mlir::tosa::TransposeOp::create(
-                    rewriter, root.getLoc(), binary.getOutput().getType(),
+                    rewriter, root.getLoc(), binary->getResult(0).getType(),
                     innerBinary->getResult(0), leftTranspose.getPerms());
                 return rewriter.replaceOp(root, replacement->getResults());
               });
@@ -258,19 +327,19 @@ struct CombineBinaryTransposePattern final
 
 // binary(transpose(x, p), y) => transpose(binary(x, transpose(y, invP)), p).
 struct CombineBinaryLeftTransposePattern final
-    : public mlir::egraph::EGraphPatternFor<mlir::tosa::MaximumOp> {
+    : public mlir::egraph::EGraphTraitPattern<
+          mlir::OpTrait::tosa::TosaElementwiseOperator> {
   mlir::LogicalResult
-  matchAndRewrite(mlir::egraph::EOpRef<mlir::tosa::MaximumOp> root,
-                  mlir::egraph::EGraphPatternRewriter &rewriter) const final {
-    mlir::tosa::MaximumOp binary = root.getOp();
+  matchTraitRoot(mlir::egraph::EOpRefBase root,
+                 mlir::egraph::EGraphPatternRewriter &rewriter) const final {
+    mlir::Operation *binary = root.getOperation();
+    if (!isTosaElementwiseBinaryOp(binary))
+      return mlir::failure();
+
     return root.getOperand(0).matchDef<mlir::tosa::TransposeOp>(
         [&](mlir::egraph::EOpRef<mlir::tosa::TransposeOp> leftRef) {
           mlir::tosa::TransposeOp leftTranspose = leftRef.getOp();
           mlir::Value leftInput = leftTranspose.getInput1();
-          auto leftType =
-              llvm::dyn_cast<mlir::RankedTensorType>(leftInput.getType());
-          if (!leftType)
-            return mlir::failure();
 
           mlir::FailureOr<llvm::SmallVector<int32_t, 4>> invPerm =
               invertPermutation(leftTranspose.getPerms());
@@ -280,16 +349,25 @@ struct CombineBinaryLeftTransposePattern final
           mlir::Value rightInput = root.getOperation()->getOperand(1);
           auto rightInnerType =
               getPermutedTensorType(rightInput.getType(), *invPerm);
-          if (mlir::failed(rightInnerType) || *rightInnerType != leftType)
+          if (mlir::failed(rightInnerType))
+            return mlir::failure();
+
+          mlir::FailureOr<mlir::RankedTensorType> resultType =
+              getPermutedTensorType(binary->getResult(0).getType(), *invPerm);
+          if (mlir::failed(resultType))
+            return mlir::failure();
+
+          if (mlir::failed(verifyBroadcastsToResultType(
+                  leftInput.getType(), *rightInnerType, *resultType)))
             return mlir::failure();
 
           auto rightTranspose = mlir::tosa::TransposeOp::create(
               rewriter, root.getLoc(), *rightInnerType, rightInput, *invPerm);
-          auto innerBinary = mlir::tosa::MaximumOp::create(
-              rewriter, root.getLoc(), leftType, leftInput,
-              rightTranspose->getResult(0));
+          mlir::Operation *innerBinary =
+              createBinaryLikeOp(rewriter, binary, root.getLoc(), *resultType,
+                                 leftInput, rightTranspose->getResult(0));
           auto replacement = mlir::tosa::TransposeOp::create(
-              rewriter, root.getLoc(), binary.getOutput().getType(),
+              rewriter, root.getLoc(), binary->getResult(0).getType(),
               innerBinary->getResult(0), leftTranspose.getPerms());
           return rewriter.replaceOp(root, replacement->getResults());
         });
@@ -298,19 +376,19 @@ struct CombineBinaryLeftTransposePattern final
 
 // binary(x, transpose(y, p)) => transpose(binary(transpose(x, invP), y), p).
 struct CombineBinaryRightTransposePattern final
-    : public mlir::egraph::EGraphPatternFor<mlir::tosa::MaximumOp> {
+    : public mlir::egraph::EGraphTraitPattern<
+          mlir::OpTrait::tosa::TosaElementwiseOperator> {
   mlir::LogicalResult
-  matchAndRewrite(mlir::egraph::EOpRef<mlir::tosa::MaximumOp> root,
-                  mlir::egraph::EGraphPatternRewriter &rewriter) const final {
-    mlir::tosa::MaximumOp binary = root.getOp();
+  matchTraitRoot(mlir::egraph::EOpRefBase root,
+                 mlir::egraph::EGraphPatternRewriter &rewriter) const final {
+    mlir::Operation *binary = root.getOperation();
+    if (!isTosaElementwiseBinaryOp(binary))
+      return mlir::failure();
+
     return root.getOperand(1).matchDef<mlir::tosa::TransposeOp>(
         [&](mlir::egraph::EOpRef<mlir::tosa::TransposeOp> rightRef) {
           mlir::tosa::TransposeOp rightTranspose = rightRef.getOp();
           mlir::Value rightInput = rightTranspose.getInput1();
-          auto rightType =
-              llvm::dyn_cast<mlir::RankedTensorType>(rightInput.getType());
-          if (!rightType)
-            return mlir::failure();
 
           mlir::FailureOr<llvm::SmallVector<int32_t, 4>> invPerm =
               invertPermutation(rightTranspose.getPerms());
@@ -320,16 +398,25 @@ struct CombineBinaryRightTransposePattern final
           mlir::Value leftInput = root.getOperation()->getOperand(0);
           auto leftInnerType =
               getPermutedTensorType(leftInput.getType(), *invPerm);
-          if (mlir::failed(leftInnerType) || *leftInnerType != rightType)
+          if (mlir::failed(leftInnerType))
+            return mlir::failure();
+
+          mlir::FailureOr<mlir::RankedTensorType> resultType =
+              getPermutedTensorType(binary->getResult(0).getType(), *invPerm);
+          if (mlir::failed(resultType))
+            return mlir::failure();
+
+          if (mlir::failed(verifyBroadcastsToResultType(
+                  *leftInnerType, rightInput.getType(), *resultType)))
             return mlir::failure();
 
           auto leftTranspose = mlir::tosa::TransposeOp::create(
               rewriter, root.getLoc(), *leftInnerType, leftInput, *invPerm);
-          auto innerBinary = mlir::tosa::MaximumOp::create(
-              rewriter, root.getLoc(), rightType, leftTranspose->getResult(0),
-              rightInput);
+          mlir::Operation *innerBinary =
+              createBinaryLikeOp(rewriter, binary, root.getLoc(), *resultType,
+                                 leftTranspose->getResult(0), rightInput);
           auto replacement = mlir::tosa::TransposeOp::create(
-              rewriter, root.getLoc(), binary.getOutput().getType(),
+              rewriter, root.getLoc(), binary->getResult(0).getType(),
               innerBinary->getResult(0), rightTranspose.getPerms());
           return rewriter.replaceOp(root, replacement->getResults());
         });
@@ -343,34 +430,41 @@ struct CombineTransposeBinaryPattern final
   matchAndRewrite(mlir::egraph::EOpRef<mlir::tosa::TransposeOp> root,
                   mlir::egraph::EGraphPatternRewriter &rewriter) const final {
     mlir::tosa::TransposeOp transpose = root.getOp();
-    return root.getOperand(0).matchDef<mlir::tosa::MaximumOp>(
-        [&](mlir::egraph::EOpRef<mlir::tosa::MaximumOp> binaryRef) {
-          mlir::Value leftInput = binaryRef.getOperation()->getOperand(0);
-          mlir::Value rightInput = binaryRef.getOperation()->getOperand(1);
-          auto leftType =
-              getPermutedTensorType(leftInput.getType(), transpose.getPerms());
-          auto rightType =
-              getPermutedTensorType(rightInput.getType(), transpose.getPerms());
-          if (mlir::failed(leftType) || mlir::failed(rightType) ||
-              *leftType != *rightType)
-            return mlir::failure();
+    return root.getOperand(0).matchDef([&](mlir::egraph::EOpRefBase binaryRef)
+                                           -> mlir::LogicalResult {
+      mlir::Operation *binary = binaryRef.getOperation();
+      if (!isTosaElementwiseBinaryOp(binary))
+        return mlir::failure();
 
-          auto leftTranspose = mlir::tosa::TransposeOp::create(
-              rewriter, root.getLoc(), *leftType, leftInput,
-              transpose.getPerms());
-          auto rightTranspose = mlir::tosa::TransposeOp::create(
-              rewriter, root.getLoc(), *rightType, rightInput,
-              transpose.getPerms());
-          auto replacement = mlir::tosa::MaximumOp::create(
-              rewriter, root.getLoc(), *leftType, leftTranspose->getResult(0),
-              rightTranspose->getResult(0));
-          return rewriter.replaceOp(root, replacement->getResults());
-        });
+      mlir::Value leftInput = binary->getOperand(0);
+      mlir::Value rightInput = binary->getOperand(1);
+      auto leftType =
+          getPermutedTensorType(leftInput.getType(), transpose.getPerms());
+      auto rightType =
+          getPermutedTensorType(rightInput.getType(), transpose.getPerms());
+      if (mlir::failed(leftType) || mlir::failed(rightType))
+        return mlir::failure();
+
+      if (mlir::failed(verifyBroadcastsToResultType(
+              *leftType, *rightType, transpose.getOutput().getType())))
+        return mlir::failure();
+
+      auto leftTranspose = mlir::tosa::TransposeOp::create(
+          rewriter, root.getLoc(), *leftType, leftInput, transpose.getPerms());
+      auto rightTranspose =
+          mlir::tosa::TransposeOp::create(rewriter, root.getLoc(), *rightType,
+                                          rightInput, transpose.getPerms());
+      mlir::Operation *replacement = createBinaryLikeOp(
+          rewriter, binary, root.getLoc(), transpose.getOutput().getType(),
+          leftTranspose->getResult(0), rightTranspose->getResult(0));
+      return rewriter.replaceOp(root, replacement->getResults());
+    });
   }
 };
 
 mlir::LogicalResult runExample(mlir::ModuleOp module) {
-  auto originalFunc = module.lookupSymbol<mlir::func::FuncOp>("transpose_example");
+  auto originalFunc =
+      module.lookupSymbol<mlir::func::FuncOp>("transpose_example");
   if (!originalFunc)
     return module.emitError("expected a func.func named @transpose_example");
   mlir::Block &originalBlock = originalFunc.getBody().front();
