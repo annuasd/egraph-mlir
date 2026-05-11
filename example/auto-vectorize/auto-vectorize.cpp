@@ -27,12 +27,6 @@
 
 namespace {
 
-// Selected nncase patterns for this minimal reproduction:
-// - VectorizeMatMul: vectorize the attention value matmul on K.
-// - VectorizeUnaryPropagation: move exp across Pack.
-// - UnaryDevectorizePropagation: relate packed and unpacked exp forms.
-// Here vector.shape_cast is the MLIR analogue of nncase Pack/Unpack.
-
 constexpr int64_t kRows = 2;
 constexpr int64_t kValueK = 8;
 constexpr int64_t kValueN = 4;
@@ -180,7 +174,7 @@ getExampleExtractCost(mlir::Operation *op) {
   return mlir::egraph::EGraphExtractCost(4);
 }
 
-// Port of nncase VectorizeMatMul for the K-vectorized value matmul case.
+// Rewrite the value matmul into the packed-K contraction form.
 struct VectorizeValueMatmulPattern final
     : public mlir::egraph::EGraphPatternFor<mlir::vector::ContractionOp> {
   mlir::LogicalResult
@@ -213,7 +207,7 @@ struct VectorizeValueMatmulPattern final
   }
 };
 
-// Port of nncase VectorizeUnaryPropagation: Pack(unary(x)) => unary(Pack(x)).
+// shape_cast(exp(x)) => exp(shape_cast(x)).
 struct PackExpPropagationPattern final
     : public mlir::egraph::EGraphPatternFor<mlir::vector::ShapeCastOp> {
   mlir::LogicalResult
@@ -239,7 +233,7 @@ struct PackExpPropagationPattern final
   }
 };
 
-// Keep the inverse direction so the e-graph can relate packed and unpacked exp.
+// exp(shape_cast(x)) => shape_cast(exp(x)).
 struct UnpackExpPropagationPattern final
     : public mlir::egraph::EGraphPatternFor<mlir::math::ExpOp> {
   mlir::LogicalResult
@@ -268,7 +262,7 @@ struct UnpackExpPropagationPattern final
   }
 };
 
-// Fold Pack(Unpack(x)) or Unpack(Pack(x)) when the endpoint type is unchanged.
+// shape_cast(shape_cast(x)) => x when the endpoint type matches.
 struct FoldShapeCastPairPattern final
     : public mlir::egraph::EGraphPatternFor<mlir::vector::ShapeCastOp> {
   mlir::LogicalResult

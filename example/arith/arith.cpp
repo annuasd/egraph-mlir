@@ -39,6 +39,7 @@ getExampleExtractCost(mlir::Operation *op) {
   return mlir::egraph::EGraphExtractCost(16);
 }
 
+// mul(x, 2) => shli(x, 1).
 struct MulByTwoToShiftPattern final
     : public mlir::egraph::EGraphPatternFor<mlir::arith::MulIOp> {
   mlir::LogicalResult
@@ -66,6 +67,7 @@ struct MulByTwoToShiftPattern final
   }
 };
 
+// div(mul(x, y), z) => mul(x, div(y, z)).
 struct ReassociateDivPattern final
     : public mlir::egraph::EGraphPatternFor<mlir::arith::DivSIOp> {
   mlir::LogicalResult
@@ -84,6 +86,7 @@ struct ReassociateDivPattern final
   }
 };
 
+// div(x, x) => 1.
 struct DivSelfToOnePattern final
     : public mlir::egraph::EGraphPatternFor<mlir::arith::DivSIOp> {
   mlir::LogicalResult
@@ -100,6 +103,7 @@ struct DivSelfToOnePattern final
   }
 };
 
+// mul(x, 1) => x.
 struct MulByOneToAliasPattern final
     : public mlir::egraph::EGraphPatternFor<mlir::arith::MulIOp> {
   mlir::LogicalResult
