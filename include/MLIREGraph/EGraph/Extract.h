@@ -10,9 +10,11 @@ class GraphMatchState;
 
 enum class EGraphExtractMode {
   Greedy,
+  /// Default LP extraction strategy. It uses Z3 when available and falls back
+  /// to OR-Tools in OR-Tools-only builds.
+  DefaultLinearProgramming,
   Z3LinearProgramming,
   OrToolsLinearProgramming,
-  LinearProgramming = Z3LinearProgramming,
 };
 
 /// Scalar cost assigned to a single candidate occurrence.
@@ -24,6 +26,7 @@ using EGraphExtractCostModel =
 
 /// Candidate selection summary produced by an extraction run.
 struct EGraphExtractInfo {
+  /// Extraction mode requested by the caller.
   EGraphExtractMode mode = EGraphExtractMode::Greedy;
   /// Ordered by egraph result slot.
   SmallVector<EValue, 4> roots;

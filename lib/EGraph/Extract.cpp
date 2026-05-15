@@ -336,6 +336,30 @@ runExtract(EGraph &graph, EGraphOp egraph,
   case EGraphExtractMode::Greedy:
     return mlir::egraph::detail::runGreedyExtract(graph, egraph, request,
                                                   costModel);
+  case EGraphExtractMode::DefaultLinearProgramming: {
+    mlir::egraph::detail::EGraphExtractRequest concreteRequest = request;
+#ifdef MLIR_EGRAPH_ENABLE_Z3
+    concreteRequest.mode = EGraphExtractMode::Z3LinearProgramming;
+    FailureOr<EGraphExtractInfo> result =
+        mlir::egraph::detail::runZ3LinearProgrammingExtract(
+            graph, egraph, concreteRequest, costModel);
+    if (failed(result))
+      return failure();
+    result->mode = EGraphExtractMode::DefaultLinearProgramming;
+    return result;
+#elif defined(MLIR_EGRAPH_ENABLE_OR_TOOLS)
+    concreteRequest.mode = EGraphExtractMode::OrToolsLinearProgramming;
+    FailureOr<EGraphExtractInfo> result =
+        mlir::egraph::detail::runOrToolsLinearProgrammingExtract(
+            graph, egraph, concreteRequest, costModel);
+    if (failed(result))
+      return failure();
+    result->mode = EGraphExtractMode::DefaultLinearProgramming;
+    return result;
+#else
+    return failure();
+#endif
+  }
   case EGraphExtractMode::Z3LinearProgramming:
 #ifdef MLIR_EGRAPH_ENABLE_Z3
     return mlir::egraph::detail::runZ3LinearProgrammingExtract(
@@ -359,8 +383,10 @@ StringRef mlir::egraph::stringifyEGraphExtractMode(EGraphExtractMode mode) {
   switch (mode) {
   case EGraphExtractMode::Greedy:
     return "greedy";
-  case EGraphExtractMode::Z3LinearProgramming:
+  case EGraphExtractMode::DefaultLinearProgramming:
     return "lp";
+  case EGraphExtractMode::Z3LinearProgramming:
+    return "z3-lp";
   case EGraphExtractMode::OrToolsLinearProgramming:
     return "or-tools-lp";
   }

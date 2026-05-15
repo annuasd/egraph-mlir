@@ -189,10 +189,12 @@ mlir::LogicalResult verifyExtractInfoSemantics(mlir::ModuleOp module,
       graph.getValue(user.getSymNameAttr())};
   mlir::egraph::EGraphExtractInfo explicitInfo;
   if (mlir::failed(mlir::egraph::extractEGraph(
-          graph, *egraph, mlir::egraph::EGraphExtractMode::LinearProgramming,
-          costModel, &explicitInfo, explicitRoots)))
+          graph, *egraph,
+          mlir::egraph::EGraphExtractMode::DefaultLinearProgramming, costModel,
+          &explicitInfo, explicitRoots)))
     return egraph->emitOpError("failed to extract explicit info");
-  if (explicitInfo.mode != mlir::egraph::EGraphExtractMode::LinearProgramming)
+  if (explicitInfo.mode !=
+      mlir::egraph::EGraphExtractMode::DefaultLinearProgramming)
     return egraph->emitOpError("explicit extract info lost its mode");
   llvm::SmallVector<mlir::StringAttr, 4> explicitExpectedRoots = {
       lhs.getSymNameAttr(), user.getSymNameAttr()};
@@ -241,8 +243,9 @@ verifyExtractCostModelSelection(mlir::ModuleOp module,
 
   mlir::egraph::EGraphExtractInfo selection;
   if (mlir::failed(mlir::egraph::extractEGraph(
-          graph, *egraph, mlir::egraph::EGraphExtractMode::LinearProgramming,
-          costModel, &selection)))
+          graph, *egraph,
+          mlir::egraph::EGraphExtractMode::DefaultLinearProgramming, costModel,
+          &selection)))
     return egraph->emitOpError("failed to select extract candidates");
 
   if (selection.roots.size() != 1 ||
@@ -3107,7 +3110,8 @@ struct TestEGraphLinearProgrammingExtractPass
     mlir::LogicalResult result = indexTestGraph(module, graph);
     if (mlir::succeeded(result))
       result = verifyLinearProgrammingExtract(
-          module, graph, mlir::egraph::EGraphExtractMode::LinearProgramming);
+          module, graph,
+          mlir::egraph::EGraphExtractMode::DefaultLinearProgramming);
 
     if (mlir::failed(result))
       signalPassFailure();

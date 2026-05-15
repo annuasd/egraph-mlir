@@ -135,7 +135,7 @@ mlir::LogicalResult runExample(mlir::ModuleOp module) {
 
   if (mlir::failed(mlir::egraph::applyEGraphPatternsAndExtract(
           originalBlock, patterns,
-          mlir::egraph::EGraphExtractMode::LinearProgramming,
+          mlir::egraph::EGraphExtractMode::DefaultLinearProgramming,
           getExampleExtractCost)))
     return module.emitError("failed to optimize @arith_example");
 
