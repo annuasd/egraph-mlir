@@ -5,6 +5,7 @@ config.mlir_egraph_obj_root = "@MLIR_EGRAPH_BINARY_DIR@"
 config.mlir_egraph_src_root = "@MLIR_EGRAPH_SOURCE_DIR@"
 config.mlir_egraph_tools_dir = lit_config.substitute("@MLIR_EGRAPH_TOOLS_DIR@")
 config.mlir_egraph_enable_z3 = "@MLIR_EGRAPH_ENABLE_Z3@"
+config.mlir_egraph_enable_or_tools = "@MLIR_EGRAPH_ENABLE_OR_TOOLS@"
 config.llvm_shlib_ext = "@SHLIBEXT@"
 
 import lit.llvm

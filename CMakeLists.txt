@@ -12,6 +12,7 @@ option(MLIR_EGRAPH_INCLUDE_TESTS "Generate MLIR-EGraph test targets" ON)
 
 find_package(MLIR REQUIRED CONFIG)
 option(MLIR_EGRAPH_ENABLE_Z3 "Enable the Z3 solver backend" OFF)
+option(MLIR_EGRAPH_ENABLE_OR_TOOLS "Enable the OR-Tools solver backend" OFF)
 
 message(STATUS "Using MLIRConfig.cmake in: ${MLIR_DIR}")
 message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
@@ -28,6 +29,14 @@ if(MLIR_EGRAPH_ENABLE_Z3)
   message(STATUS "Using Z3 solver backend target: z3::libz3")
 else()
   message(STATUS "Z3 solver backend disabled")
+endif()
+
+if(MLIR_EGRAPH_ENABLE_OR_TOOLS)
+  set(CMAKE_BUILD_WITH_INSTALL_RPATH ON)
+  set(CMAKE_INSTALL_RPATH_USE_LINK_PATH ON)
+  find_package(ortools CONFIG REQUIRED)
+else()
+  message(STATUS "OR-Tools solver backend disabled")
 endif()
 
 set(LLVM_RUNTIME_OUTPUT_INTDIR ${CMAKE_BINARY_DIR}/bin)

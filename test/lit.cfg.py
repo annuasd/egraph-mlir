@@ -29,6 +29,12 @@ def cmake_bool(value):
 if cmake_bool(getattr(config, "mlir_egraph_enable_z3", "OFF")):
     config.available_features.add("z3")
 
+if cmake_bool(getattr(config, "mlir_egraph_enable_or_tools", "OFF")):
+    config.available_features.add("or-tools")
+
+if "z3" in config.available_features or "or-tools" in config.available_features:
+    config.available_features.add("lp-backend")
+
 llvm_config.with_system_environment(["HOME", "INCLUDE", "LIB", "TMP", "TEMP"])
 llvm_config.use_default_substitutions()
 

@@ -1,3 +1,4 @@
+// REQUIRES: lp-backend
 // RUN: mlir-egraph-opt %s --test-egraph-extract-info 2>&1 | FileCheck %s
 
 module {

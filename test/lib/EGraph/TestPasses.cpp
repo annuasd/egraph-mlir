@@ -580,9 +580,9 @@ mlir::LogicalResult verifyGreedyExtract(mlir::ModuleOp module,
   return mlir::success();
 }
 
-mlir::LogicalResult
-verifyLinearProgrammingExtract(mlir::ModuleOp module,
-                               mlir::egraph::EGraph &graph) {
+mlir::LogicalResult verifyLinearProgrammingExtract(
+    mlir::ModuleOp module, mlir::egraph::EGraph &graph,
+    mlir::egraph::EGraphExtractMode mode) {
   mlir::FailureOr<mlir::egraph::EGraphOp> egraph =
       getSingleActiveEGraph(module);
   if (mlir::failed(egraph))
@@ -630,12 +630,12 @@ verifyLinearProgrammingExtract(mlir::ModuleOp module,
   };
 
   mlir::egraph::EGraphExtractInfo selection;
-  if (mlir::failed(mlir::egraph::extractEGraph(
-          graph, *egraph, mlir::egraph::EGraphExtractMode::LinearProgramming,
-          costModel, &selection)))
+  if (mlir::failed(
+          mlir::egraph::extractEGraph(graph, *egraph, mode, costModel,
+                                      &selection)))
     return egraph->emitOpError("failed to run LP extract");
 
-  if (selection.mode != mlir::egraph::EGraphExtractMode::LinearProgramming ||
+  if (selection.mode != mode ||
       selection.selectedEClasses.size() !=
           selection.selectedCandidateRoots.size() ||
       selection.selectedEClasses.size() !=
@@ -706,9 +706,9 @@ verifyLinearProgrammingExtract(mlir::ModuleOp module,
       graph.getValue(tieRoot.getSymNameAttr()),
       graph.getValue(inputAliasRoot.getSymNameAttr())};
   mlir::egraph::EGraphExtractInfo cyclicSelection;
-  if (mlir::succeeded(mlir::egraph::extractEGraph(
-          graph, *egraph, mlir::egraph::EGraphExtractMode::LinearProgramming,
-          costModel, &cyclicSelection, cyclicRoots)))
+  if (mlir::succeeded(
+          mlir::egraph::extractEGraph(graph, *egraph, mode, costModel,
+                                      &cyclicSelection, cyclicRoots)))
     return cycle.emitOpError("LP extract unexpectedly accepted a cyclic root");
 
   cycle.emitRemark() << "lp extract rejected cyclic root";
@@ -3093,7 +3093,7 @@ struct TestEGraphLinearProgrammingExtractPass
   llvm::StringRef getArgument() const final { return "test-egraph-extract-lp"; }
 
   llvm::StringRef getDescription() const final {
-    return "test MLIR-EGraph Z3-backed LP extract selection";
+    return "test MLIR-EGraph LP extract selection";
   }
 
   void getDependentDialects(mlir::DialectRegistry &registry) const final {
@@ -3106,7 +3106,41 @@ struct TestEGraphLinearProgrammingExtractPass
     mlir::egraph::EGraph graph;
     mlir::LogicalResult result = indexTestGraph(module, graph);
     if (mlir::succeeded(result))
-      result = verifyLinearProgrammingExtract(module, graph);
+      result = verifyLinearProgrammingExtract(
+          module, graph, mlir::egraph::EGraphExtractMode::LinearProgramming);
+
+    if (mlir::failed(result))
+      signalPassFailure();
+  }
+};
+
+struct TestEGraphOrToolsLinearProgrammingExtractPass
+    : public mlir::PassWrapper<TestEGraphOrToolsLinearProgrammingExtractPass,
+                               mlir::OperationPass<mlir::ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
+      TestEGraphOrToolsLinearProgrammingExtractPass)
+
+  llvm::StringRef getArgument() const final {
+    return "test-egraph-extract-lp-or-tools";
+  }
+
+  llvm::StringRef getDescription() const final {
+    return "test MLIR-EGraph OR-Tools-backed LP extract selection";
+  }
+
+  void getDependentDialects(mlir::DialectRegistry &registry) const final {
+    registry.insert<mlir::arith::ArithDialect>();
+    registry.insert<mlir::egraph::EGraphDialect>();
+  }
+
+  void runOnOperation() final {
+    mlir::ModuleOp module = getOperation();
+    mlir::egraph::EGraph graph;
+    mlir::LogicalResult result = indexTestGraph(module, graph);
+    if (mlir::succeeded(result))
+      result = verifyLinearProgrammingExtract(
+          module, graph,
+          mlir::egraph::EGraphExtractMode::OrToolsLinearProgramming);
 
     if (mlir::failed(result))
       signalPassFailure();
@@ -3462,6 +3496,7 @@ void registerEGraphTestPasses() {
   mlir::PassRegistration<TestEGraphExtractCostModelPass>();
   mlir::PassRegistration<TestEGraphGreedyExtractPass>();
   mlir::PassRegistration<TestEGraphLinearProgrammingExtractPass>();
+  mlir::PassRegistration<TestEGraphOrToolsLinearProgrammingExtractPass>();
   mlir::PassRegistration<TestEGraphExtractMaterializationPass>();
   mlir::PassRegistration<TestEGraphSymbolicEValuePass>();
   mlir::PassRegistration<TestEGraphSymbolicIndexPass>();

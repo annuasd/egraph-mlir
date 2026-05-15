@@ -10,7 +10,9 @@ class GraphMatchState;
 
 enum class EGraphExtractMode {
   Greedy,
-  LinearProgramming,
+  Z3LinearProgramming,
+  OrToolsLinearProgramming,
+  LinearProgramming = Z3LinearProgramming,
 };
 
 /// Scalar cost assigned to a single candidate occurrence.
@@ -20,7 +22,7 @@ using EGraphExtractCost = uint64_t;
 using EGraphExtractCostModel =
     llvm::function_ref<FailureOr<EGraphExtractCost>(Operation *)>;
 
-/// Candidate selection summary produced by an extraction backend.
+/// Candidate selection summary produced by an extraction run.
 struct EGraphExtractInfo {
   EGraphExtractMode mode = EGraphExtractMode::Greedy;
   /// Ordered by egraph result slot.

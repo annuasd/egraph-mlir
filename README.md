@@ -8,13 +8,11 @@ rebuilding optimized MLIR IR.
 ## Build
 
 ```sh
-cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON 
+cmake -S . -B build 
 # Use Z3 for graph extraction.
 # -DMLIR_EGRAPH_ENABLE_Z3=ON
-# If LLVM/MLIR/Z3 are not in the default CMake search path, add:
-# -DLLVM_DIR=/path/to/llvm/lib/cmake/llvm
-# -DMLIR_DIR=/path/to/llvm/lib/cmake/mlir
-# -DZ3_DIR=/path/to/z3/lib/cmake/z3
+# Use OR-Tools for graph extraction.
+# -DMLIR_EGRAPH_ENABLE_OR_TOOLS=ON
 
 # Run tests.
 cmake --build build --target check-mlir-egraph

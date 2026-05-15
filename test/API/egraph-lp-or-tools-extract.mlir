@@ -1,8 +1,8 @@
-// REQUIRES: lp-backend
-// RUN: mlir-egraph-opt %s --test-egraph-extract-lp 2>&1 | FileCheck %s
+// REQUIRES: or-tools
+// RUN: mlir-egraph-opt %s --test-egraph-extract-lp-or-tools 2>&1 | FileCheck %s
 
 module {
-  // Exercise LP-backed global selection, deterministic tie-break, alias
+  // Exercise OR-Tools-backed global selection, deterministic tie-break, alias
   // forwarding, and cycle rejection.
   egraph.egraph @lp_extract(%x: i32) -> (i32, i32, i32, i32) {
     egraph.input @x = %x : i32
